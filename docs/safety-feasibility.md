@@ -31,7 +31,9 @@ No implementation was scaffolded. No test, model turn or image generation was ex
 
 ## Scope of evidence (what was and was not done)
 
-- Installed binary: `/Users/niki/.local/bin/codex --version` → `codex-cli 0.156.0`.
+- Installed binary: `/Users/example-user/.local/bin/codex --version` → `codex-cli 0.156.0`.
+  (Home directory replaced with the placeholder `/Users/example-user` in release 0.2.1;
+  the observation itself is unchanged.)
   Inspected `--help`, `app-server --help`, `app-server generate-json-schema --help`.
   The `codex features --help` and `codex exec --help` calls were denied by the harness and never ran.
 - Schema: `codex app-server generate-json-schema --experimental --out research/schema-0.156.0`.

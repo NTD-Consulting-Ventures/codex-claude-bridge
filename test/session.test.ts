@@ -414,7 +414,7 @@ test("auth and quota turn failures are typed; raw messages are not surfaced", as
 });
 
 test("codexErrorInfo other: diagnostic carries only the message class and whitelisted http status", async () => {
-  const msg = "after_agent hook 'gate' failed and aborted turn completion: token=SECRET at /Users/niki/x (status 503)";
+  const msg = "after_agent hook 'gate' failed and aborted turn completion: token=SECRET at /Users/example-user/x (status 503)";
   const fake = new FakeAppServer(completingScript([turnCompleted("failed", { message: msg, codexErrorInfo: "other" })]));
   await assert.rejects(runDelegatedTurn(opts(fake)), (e: unknown) => {
     assert.ok(e instanceof TaskError && e.code === "TURN_FAILED");

@@ -108,7 +108,7 @@ test("auth error is classified and message is sanitized", async () => {
   const t = new FakeTransport();
   const c = new CodexRpcClient(t);
   const p = c.request("thread/start");
-  t.emit({ jsonrpc: "2.0", id: t.sent(0).id, error: { code: -32000, message: "Not logged in. token=sk-SECRET at /Users/niki/.codex/auth.json" } });
+  t.emit({ jsonrpc: "2.0", id: t.sent(0).id, error: { code: -32000, message: "Not logged in. token=sk-SECRET at /Users/example-user/.codex/auth.json" } });
   await assert.rejects(p, (e: unknown) => {
     assert.ok(isKind("auth_required")(e));
     const msg = (e as Error).message;

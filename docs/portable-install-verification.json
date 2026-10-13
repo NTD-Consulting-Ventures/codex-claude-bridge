@@ -1,0 +1,46 @@
+{
+  "note": "Sanitized summary of the final 0.2.1 portable-installer verification. Receipt paths are relative to the repository root and point into git-ignored folders (.harness-evidence/, .smoke/); those private receipts are not shipped. No credentials, account data, session ids or host paths are included.",
+  "release": "0.2.1",
+  "automated": {
+    "tests_passed": 214,
+    "tests_failed": 0,
+    "lint": true,
+    "typecheck": true,
+    "build": true,
+    "git_diff_check": true
+  },
+  "conditions": {
+    "official_clis": true,
+    "isolated_claude_config_dir": true,
+    "path": "/usr/bin:/bin",
+    "credentials_copied": false,
+    "direct_config_reads": false,
+    "global_config_mutated": false
+  },
+  "installer": [
+    { "claude": "2.1.293", "codex": "0.156.0", "codex_install": "native", "server_id": "codex-claude-bridge", "apply": true, "readback": true, "collision_exit_2_no_change": true, "receipt": ".harness-evidence/final-install-293-156.json" },
+    { "claude": "2.1.293", "codex": "0.162.1", "codex_install": "official npm (Node launcher)", "server_id": "codex-claude-bridge", "apply": true, "readback": true, "collision_exit_2_no_change": true, "receipt": ".harness-evidence/final-install-293-162.json" },
+    { "claude": "2.1.295", "codex": "0.156.0", "codex_install": "native", "server_id": "codex-claude-bridge", "apply": true, "readback": true, "collision_exit_2_no_change": true, "sentinel_registrations": 19, "truncation_recognized": true, "first_last_sentinel_unchanged": true, "receipt": ".harness-evidence/final-install-295-156.json" },
+    { "claude": "2.1.295", "codex": "0.162.1", "codex_install": "official npm (Node launcher)", "server_id": "codex-claude-bridge", "apply": true, "readback": true, "collision_exit_2_no_change": true, "sentinel_registrations": 19, "truncation_recognized": true, "first_last_sentinel_unchanged": true, "receipt": ".harness-evidence/final-install-295-162.json" }
+  ],
+  "legacy_preservation": [
+    { "claude": "2.1.293", "legacy_id": "codex-image-mcp", "custom_sentinel_override_preserved": true, "canonical_duplicate_created": false, "receipt": ".harness-evidence/final-legacy-293.json" },
+    { "claude": "2.1.295", "legacy_id": "codex-image-mcp", "custom_sentinel_override_preserved": true, "canonical_duplicate_created": false, "receipt": ".harness-evidence/final-legacy-295.json" }
+  ],
+  "runtime": {
+    "client": "MCP SDK smoke client (not a Claude-driven harness run)",
+    "initialize_experimental_api": false,
+    "upstream_app_server_label": "experimental",
+    "results": [
+      { "codex": "0.156.0", "tools_listed": 5, "status": true, "status_receipt": ".smoke/87864c88-44c7-4055-9cf5-76866bd8453c/evidence.json", "owned_create_modify_byte_exact": true, "outside_sentinel_unchanged": true, "write_receipt": ".smoke/f1c9639b-f969-4715-a3a3-66b8024cad98/evidence.json" },
+      { "codex": "0.162.1", "tools_listed": 5, "status": true, "status_receipt": ".smoke/4467a82a-9c8b-4257-b23d-8022acdae5c3/evidence.json", "owned_create_modify_byte_exact": true, "outside_sentinel_unchanged": true, "write_receipt": ".smoke/d39a4c53-6092-442f-ba8c-86dab010f9d6/evidence.json" }
+    ]
+  },
+  "not_covered": [
+    "image generation",
+    "plugins",
+    "live --check-auth (fixture tests only)",
+    "remote machines",
+    "future CLI versions (results cover the tested local versions only)"
+  ]
+}
