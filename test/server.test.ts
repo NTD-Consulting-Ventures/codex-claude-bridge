@@ -36,7 +36,7 @@ async function waitDone(h: ToolHandler, id: string): Promise<Record<string, unkn
 
 test("sanitizeVersion accepts only the expected shape", () => {
   assert.equal(sanitizeVersion("codex-cli 0.156.0\n"), "0.156.0");
-  assert.equal(sanitizeVersion("codex-cli 0.156.0 user=niki@example.com"), null);
+  assert.equal(sanitizeVersion("codex-cli 0.156.0 user=example-user@example.com"), null);
   assert.equal(sanitizeVersion(""), null);
 });
 
@@ -60,7 +60,7 @@ test("codex_status with no env reports the default root ~/codex-images as enable
   const s = (await handler().call("codex_status", {})).structuredContent as Record<string, any>;
   assert.equal(s.image_generate_enabled, true);
   assert.deepEqual(s.image_output, { root: path.join(os.homedir(), "codex-images"), source: "default", error: null });
-  assert.equal(s.server_version, "0.2.0");
+  assert.equal(s.server_version, "0.2.1");
   const o = (await handler({ env: { CODEX_IMAGE_OUTPUT_ROOT: "/abs/out" } }).call("codex_status", {})).structuredContent as Record<string, any>;
   assert.deepEqual(o.image_output, { root: "/abs/out", source: "env", error: null });
 });

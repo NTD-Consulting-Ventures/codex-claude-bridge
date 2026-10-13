@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import os from "node:os";
 import { CodexClientError, CodexRpcClient, type CodexTransport } from "./codex-client.js";
 import { resolveOutputRoot, type OutputRootInvalidReason, type OutputRootResolution } from "./output-root.js";
+import { launcherStatus, launchEnv, VERSION_PROBE_BASE_ENV, type LauncherStatus } from "./launch.js";
 import { resolveCodexBin, spawnAppServer } from "./process-transport.js";
 import { APPROVAL_POLICY, APPROVALS_REVIEWER, initializeParams, SANDBOX_MODE } from "./session.js";
 
@@ -13,7 +14,7 @@ const MAX_LISTED = 100;
 const MCP_PAGE_LIMIT = 50;
 const MAX_MCP_PAGES = 4;
 const MAX_CURSOR_CHARS = 1024;
-export const SERVER_VERSION = "0.2.0";
+export const SERVER_VERSION = "0.2.1";
 
 export interface VersionProbeResult {
   ok: boolean;
@@ -22,8 +23,11 @@ export interface VersionProbeResult {
 
 export type VersionProbe = () => Promise<VersionProbeResult>;
 
-/** Bounded spawn of `codex --version`: no shell, minimal env, timeout, output cap. */
-export const probeCodexVersion: VersionProbe = () =>
+/**
+ * Bounded spawn of `codex --version`: no shell, minimal env (plus the verified
+ * current-Node directory on PATH, src/launch.ts), timeout, output cap.
+ */
+export const versionProbeFor = (env: NodeJS.ProcessEnv = process.env): VersionProbe => () =>
   new Promise((resolve) => {
     let out = "";
     let bytes = 0;
@@ -34,7 +38,7 @@ export const probeCodexVersion: VersionProbe = () =>
       clearTimeout(timer);
       resolve(r);
     };
-    const bin = resolveCodexBin().path;
+    const bin = resolveCodexBin(env).path;
     if (bin === null) {
       resolve({ ok: false, stdout: "" });
       return;
@@ -44,7 +48,7 @@ export const probeCodexVersion: VersionProbe = () =>
       child = spawn(bin, ["--version"], {
         shell: false,
         stdio: ["ignore", "pipe", "ignore"],
-        env: { PATH: "/usr/bin:/bin" },
+        env: launchEnv(VERSION_PROBE_BASE_ENV),
         windowsHide: true,
       });
     } catch {
@@ -68,6 +72,8 @@ export const probeCodexVersion: VersionProbe = () =>
     child.on("error", () => finish({ ok: false, stdout: "" }));
     child.on("close", (code) => finish({ ok: code === 0, stdout: out }));
   });
+
+export const probeCodexVersion: VersionProbe = versionProbeFor();
 
 export function sanitizeVersion(stdout: string): string | null {
   const m = /^codex-cli (\d{1,4}\.\d{1,4}\.\d{1,4}(?:-[0-9A-Za-z.]{1,32})?)\s*$/.exec(stdout.trim());
@@ -271,7 +277,7 @@ export async function probeCapabilities(
 }
 
 export interface CodexStatus {
-  server: "codex-image-mcp";
+  server: "codex-claude-bridge";
   server_version: string;
   mode: "trusted-local-delegation";
   codex_cli_version: string | null;
@@ -285,6 +291,8 @@ export interface CodexStatus {
     temp_dirs_writable: false;
     experimental_api: false;
   };
+  /** Codex launcher, current Node and whether its directory is put on the children's PATH. */
+  runtime: LauncherStatus;
   plugins: Listing<PluginSummary>;
   mcp_servers: Listing<McpServerSummary>;
   /** True only when the output root configuration is valid. */
@@ -311,6 +319,7 @@ export async function getStatus(
   probe: VersionProbe = probeCodexVersion,
   capabilities: CapabilityProbe = probeCapabilities,
   outputRoot: OutputRootResolution = resolveOutputRoot(),
+  runtime: LauncherStatus = launcherStatus(resolveCodexBin()),
 ): Promise<CodexStatus> {
   const version = await codexVersion(probe);
   let caps: CapabilityProbeResult;
@@ -324,7 +333,7 @@ export async function getStatus(
     }
   }
   return {
-    server: "codex-image-mcp",
+    server: "codex-claude-bridge",
     server_version: SERVER_VERSION,
     mode: "trusted-local-delegation",
     codex_cli_version: version,
@@ -338,6 +347,7 @@ export async function getStatus(
       temp_dirs_writable: false,
       experimental_api: false,
     },
+    runtime,
     plugins: caps.plugins,
     mcp_servers: caps.mcp_servers,
     image_generate_enabled: outputRoot.ok,

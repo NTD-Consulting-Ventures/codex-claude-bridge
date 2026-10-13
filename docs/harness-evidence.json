@@ -1,6 +1,7 @@
 {
   "task": "t_565ce4e9",
   "note": "Sanitized summary of .harness-evidence/. Raw prompts, raw results and session ids are omitted.",
+  "path_substitution_note": "Release 0.2.1 replaced the original personal home directory in the historic paths below with the neutral placeholder /Users/example-user. Only the user name segment changed; the recorded observations are otherwise unchanged.",
   "harness": {
     "client": "Claude Code (official)",
     "client_version": "2.1.293",
@@ -20,9 +21,9 @@
     ],
     "allowed_tools": [
       "Read", "Write", "Edit", "Glob", "Grep",
-      "Bash(/Users/niki/.local/bin/codex --help)",
-      "Bash(/Users/niki/.local/bin/codex --version)",
-      "Bash(/Users/niki/.local/bin/codex app-server *)",
+      "Bash(/Users/example-user/.local/bin/codex --help)",
+      "Bash(/Users/example-user/.local/bin/codex --version)",
+      "Bash(/Users/example-user/.local/bin/codex app-server *)",
       "Bash(curl *https://raw.githubusercontent.com/openai/codex/*)",
       "Bash(curl *https://api.github.com/repos/openai/codex/*)",
       "WebFetch(domain:raw.githubusercontent.com)",
@@ -188,9 +189,22 @@
     "auth_or_config_reads": 0,
     "codex_login_attempts": 0
   },
+  "release_0_2_1_portable_install": {
+    "note": "Sanitized from the git-ignored parent report .harness-evidence/partial-report.json. Checks ran on a pre-correction candidate that still registered the ID codex-image-mcp; the later correction (canonical ID codex-claude-bridge, dual-ID preflight, 2.1.295 truncation suffix, --check-auth) is not yet verified live.",
+    "first_invocation": { "model": "claude-opus-5-5", "turns": 82, "cost_usd": 3.0198, "permission_denials": 0 },
+    "parent_checks": { "npm_test": "211 passed, 0 failed", "lint": 0, "typecheck": 0, "build": 0 },
+    "isolated_installer": [
+      { "claude": "2.1.293", "codex": "0.156.0", "result": "dry run, apply, readback and collision passed" },
+      { "claude": "2.1.293", "codex": "0.162.1", "launcher": "npm Node launcher, minimal PATH", "result": "passed" },
+      { "claude": "2.1.295", "codex": "0.156.0", "result": "exit 3 fail-closed with 19 configured servers (parenthesized truncation suffix not understood); target stayed absent" }
+    ],
+    "mcp_status_smoke": { "codex": ["0.156.0", "0.162.1 (npm Node launcher, minimal PATH)"], "all_five_tools_listed": true, "exit_codes": [0, 0] },
+    "owned_write_smoke": { "codex": "0.162.1", "create_and_modify_byte_exact": true, "outside_sentinel_unchanged": true, "images_or_plugin_calls": false },
+    "pending": ["corrected 2.1.295 installer matrix", "current-tree write smoke with Codex 0.156.0", "live image generation"]
+  },
   "provenance": {
     "installed_codex": {
-      "path": "/Users/niki/.local/bin/codex",
+      "path": "/Users/example-user/.local/bin/codex",
       "version_output": "codex-cli 0.156.0"
     },
     "schema": {

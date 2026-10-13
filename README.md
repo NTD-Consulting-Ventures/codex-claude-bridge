@@ -4,11 +4,13 @@ A local MCP server that lets Claude Code hand tasks and image generation to the 
 
 ## Prerequisites
 
-- macOS with Node.js 22 or newer and git.
-- The official Codex CLI, signed in by you (`codex login`).
-- Official Claude Code, signed in by you (`claude auth login`).
+Install and sign in yourself; setup never installs, downloads or signs in for you.
 
-Each tool uses your own sign-in. Never copy tokens or config files between machines.
+- Node.js 22+ and git: <https://nodejs.org/en/download>
+- Codex CLI: `npm install -g @openai/codex` (or `brew install --cask codex`), then `codex login`
+- Claude Code: `curl -fsSL https://claude.ai/install.sh | bash`, then `claude auth login`
+
+Never copy tokens or config files between machines.
 
 ## Install
 
@@ -17,18 +19,28 @@ git clone https://github.com/NTD-Consulting-Ventures/codex-claude-bridge.git
 cd codex-claude-bridge
 npm ci
 npm run build
-codex login
-claude auth login
-npm run register              # dry run: prints the exact command, changes nothing
-npm run register -- --apply   # registers the MCP server "codex-image-mcp" (user scope)
+npm run register                  # dry run: shows the claude/codex/node it found, changes nothing
+npm run register -- --apply       # registers "codex-claude-bridge" (user scope) and verifies it
+npm run register -- --check-auth  # optional: sign-in status of the exact claude/codex found
 ```
 
-The script never overwrites an existing registration. It uses `claude` from your PATH
-and `~/.local/bin/codex` unless you set `CLAUDE_BIN` / `CODEX_BIN` to absolute paths.
-If it stops, see [setup details](docs/setup.md), including the manual fallback.
+`--check-auth` only reports whether `codex login status` and `claude auth status` exit 0,
+using the same absolute paths and Node `PATH` as the registration. If one is not signed
+in, it prints the exact official login command to run yourself; registration works either way.
+
+Your Terminal `PATH` is only used to *find* `claude` and `codex` (also `~/.local/bin`,
+Homebrew, `npm prefix -g`). The registration stores absolute paths to Codex, Node and the
+server, so Claude Desktop does not need your shell setup. Set `CLAUDE_BIN` / `CODEX_BIN`
+to absolute paths to choose explicitly. If a registration named `codex-claude-bridge` or
+the earlier `codex-image-mcp` already exists, the script stops (exit 2) and leaves it as
+is; an existing `codex-image-mcp` keeps working. Afterwards start a new Claude Code
+session (in Claude Desktop, a new Code session is enough).
 
 Images are saved to `~/codex-images` by default. Set `CODEX_IMAGE_OUTPUT_ROOT` to an
 absolute path before registering to use another folder.
+
+Update in place: `git pull --ff-only && npm ci && npm run build` (no re-registration).
+If a stored path changes, see [Updating](docs/setup.md#updating).
 
 ## Example
 
@@ -38,37 +50,26 @@ Start a new Claude Code session in a throwaway folder and ask:
 > `Create hello.txt containing hello, then draw a small red apple.` Poll
 > `codex_task_status` with the returned `job_id` until it is no longer `running`.
 
-A successful result looks like this:
-
-```json
-{ "text": "…", "text_truncated": false, "image_items": 1,
-  "files": [{ "path": "/Users/you/codex-images/<uuid>/<uuid>.png",
-              "mime_type": "image/png", "bytes": 123456, "sha256": "…" }] }
-```
-
-`files` is empty when Codex made no image. `codex_image_generate` takes the same
-`{prompt, cwd}` and returns `{job_id, files, codex_version}`. `codex_status` shows the
-Codex version, the launch policy and the image folder in use.
-
-This example is documentation only. It was not run for this release.
+A successful result lists saved images in `files` (empty when Codex made none), e.g.
+`/Users/you/codex-images/<uuid>/<uuid>.png`. `codex_status` shows the Codex version and
+launcher, Node, the launch policy and the image folder. This example is documentation
+only; it was not run for this release.
 
 ## Limits
 
-- Codex can write only inside `cwd`, with no network access. Anything that needs approval
-  stops the job with `APPROVAL_REQUIRED`. Nothing is approved for you.
-- Codex still runs with your normal config, plugins and MCP servers. This is a
+- Codex runs with `workspace-write`: it can write only inside `cwd`, with no network.
+  Anything needing approval stops the job with `APPROVAL_REQUIRED`; nothing is approved for you.
+- Codex still uses your normal config, plugins and MCP servers. This is a trusted-local
   convenience, not a security boundary.
-- One job at a time, 300 s by default. Failed jobs are not retried. Image generation may
-  use up your plan allowance.
-- Live image generation has not been verified for this release.
-- Tested with Codex CLI 0.156.0 and Claude Code 2.1.293 only.
+- One job at a time, 300 s by default, no retries. Image generation may use your plan
+  allowance; live image generation has not been verified for this release.
+- Tested combinations and pending checks: [docs/verification.md](docs/verification.md).
 
 ## More documentation
 
-- [Setup details, manual fallback and uninstall](docs/setup.md)
+- [Setup details, discovery, updating, manual fallback and uninstall](docs/setup.md)
 - [Security model, tools and protocol](docs/reference.md)
 - [Troubleshooting](docs/troubleshooting.md)
-- [Verification status and evidence](docs/verification.md)
 
 ## License
 

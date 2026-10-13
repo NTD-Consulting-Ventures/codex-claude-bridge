@@ -35,7 +35,7 @@ test("http status is taken from the message only when named and in the fixed set
 test("redaction removes credentials, identity, urls, paths and ids and bounds length", () => {
   const raw =
     "Bearer abc.def token=tok123 api_key: k1 sk-proj-AbCdEf123456 eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig " +
-    "user someone@example.org at https://api.example.com/v1/x?key=SECRETQ in /Users/niki/.codex/config.toml " +
+    "user someone@example.org at https://api.example.com/v1/x?key=SECRETQ in /Users/example-user/.codex/config.toml " +
     "~/x/y C:\\Users\\n acct 123e4567-e89b-12d3-a456-426614174000 opaque " + "Z".repeat(40) + " and/or ok\u0007";
   const r = redactMessage(raw)!;
   for (const leak of ["abc.def", "tok123", "k1 ", "sk-proj", "eyJ", "someone@", "example.org", "example.com", "SECRETQ", "/Users", ".codex", "~/x", "C:\\", "123e4567", "ZZZZ", "\u0007"]) {

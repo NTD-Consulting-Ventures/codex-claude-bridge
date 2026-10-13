@@ -56,7 +56,7 @@
 
 | tool | input | notes |
 |---|---|---|
-| `codex_status` | `{}` | CLI version, launch policy, plugin and MCP server names (bounded, sanitized), `image_generate_enabled`, `image_output: {root, source: "default"\|"env", error}`. |
+| `codex_status` | `{}` | CLI version, launch policy, plugin and MCP server names (bounded, sanitized), `image_generate_enabled`, `image_output: {root, source: "default"\|"env", error}`, `runtime: {codex_bin, codex_bin_source, codex_launcher: "native"\|"node_shebang"\|"other_script"\|"unknown"\|"missing"\|"invalid", node_path, node_version, node_dir_on_child_path}`. |
 | `codex_task_start` | `{prompt, cwd}` | `cwd`: absolute, normalized, existing directory, no symlinks, not `/`, `$HOME` or an ancestor. Returns `job_id`. Succeeded result: `{text, text_truncated, image_items, files: [{path, mime_type, bytes, sha256}]}`; `files` is `[]` when no image was produced. |
 | `codex_task_status` | `{job_id}` | `running` / `succeeded` / `failed` / `cancelled`, result or typed error. |
 | `codex_task_cancel` | `{job_id}` | Interrupts the turn and kills the process. |

@@ -21,7 +21,8 @@ import { DEFAULT_WALL_MS, JobManager, MAX_WALL_MS, throwIfAborted } from "./jobs
 import { resolveOutputRoot, type OutputRootResolution } from "./output-root.js";
 import { resolveCodexBin, spawnAppServer, terminateAllAppServers } from "./process-transport.js";
 import { runDelegatedTurn, TaskError, type TurnOutcome } from "./session.js";
-import { codexVersion, getStatus, SERVER_VERSION, type CapabilityProbe, type VersionProbe } from "./status.js";
+import { codexVersion, getStatus, SERVER_VERSION, versionProbeFor, type CapabilityProbe, type VersionProbe } from "./status.js";
+import { launcherStatus } from "./launch.js";
 
 export const MAX_PROMPT_CHARS = 32_000;
 
@@ -166,7 +167,12 @@ export class ToolHandler {
     switch (name) {
       case "codex_status": {
         if (!exactKeys(args, [])) return err("INVALID_ARGUMENTS", "codex_status accepts no arguments.");
-        const s = await getStatus(this.deps.versionProbe, this.deps.capabilityProbe, this.outputRoot);
+        const s = await getStatus(
+          this.deps.versionProbe ?? versionProbeFor(this.env),
+          this.deps.capabilityProbe,
+          this.outputRoot,
+          launcherStatus(resolveCodexBin(this.env)),
+        );
         return ok({ ...s, active_job_id: this.jobs.active ?? null });
       }
       case "codex_task_start":
@@ -238,7 +244,7 @@ export class ToolHandler {
         return { text: outcome.text, text_truncated: outcome.textTruncated, image_items: outcome.images.length, files };
       }
       const files = await collect(outcome);
-      const version = await codexVersion(this.deps.versionProbe);
+      const version = await codexVersion(this.deps.versionProbe ?? versionProbeFor(this.env));
       checkpoint();
       const result: ImageResult = { job_id: jobId, files, codex_version: version };
       return result;
@@ -250,7 +256,7 @@ export class ToolHandler {
 
 export function buildServer(deps: ServerDeps = {}): { server: Server; handler: ToolHandler } {
   const handler = new ToolHandler(deps);
-  const server = new Server({ name: "codex-image-mcp", version: SERVER_VERSION }, { capabilities: { tools: {} } });
+  const server = new Server({ name: "codex-claude-bridge", version: SERVER_VERSION }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: handler.listTools() }));
   server.setRequestHandler(CallToolRequestSchema, async (req) => {
     try {

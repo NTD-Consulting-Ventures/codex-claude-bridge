@@ -3,7 +3,8 @@
 // Launched with exactly `app-server --listen stdio://`. No --config overrides,
 // no bypass/dangerous flags, no shell. The inherited environment is kept so
 // the user's normal Codex home, config and login are used unchanged; this
-// process never reads them itself.
+// process never reads them itself. Only PATH is adjusted (src/launch.ts) so an
+// npm `#!/usr/bin/env node` Codex launcher finds the verified current Node.
 //
 // Process ownership: on POSIX the child is spawned `detached`, i.e. as the
 // leader of a NEW process group whose id equals its pid. Everything Codex
@@ -17,6 +18,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import type { CodexTransport } from "./codex-client.js";
+import { isAbsoluteNormalized, launchEnv } from "./launch.js";
 
 export const APP_SERVER_ARGS = ["app-server", "--listen", "stdio://"] as const;
 export const KILL_GRACE_MS = 2_000;
@@ -35,12 +37,14 @@ export function defaultCodexBin(): string {
 
 /**
  * CODEX_BIN (absolute, normalized) overrides the default `~/.local/bin/codex`.
- * A set-but-invalid CODEX_BIN fails closed (path null); it never falls back.
+ * A set-but-invalid CODEX_BIN, including an empty one, fails closed (path
+ * null); it never falls back. No PATH or npm discovery at runtime: the
+ * installer persists the discovered absolute path as CODEX_BIN.
  */
 export function resolveCodexBin(env: NodeJS.ProcessEnv = process.env): CodexBin {
   const raw = env.CODEX_BIN;
-  if (raw === undefined || raw === "") return { path: defaultCodexBin(), source: "default" };
-  if (raw.includes("\0") || !path.isAbsolute(raw) || path.normalize(raw) !== raw) return { path: null, source: "env" };
+  if (raw === undefined) return { path: defaultCodexBin(), source: "default" };
+  if (!isAbsoluteNormalized(raw)) return { path: null, source: "env" };
   return { path: raw, source: "env" };
 }
 
@@ -48,6 +52,8 @@ export interface SpawnOptions {
   bin: string;
   /** Explicit absolute working directory of the app-server process. */
   cwd: string;
+  /** Environment before the shared launch PATH adjustment (default process.env). */
+  baseEnv?: NodeJS.ProcessEnv;
 }
 
 interface LiveGroup {
@@ -84,7 +90,7 @@ export function spawnAppServer(opts: SpawnOptions): CodexTransport {
     shell: false,
     detached: useGroup,
     stdio: ["pipe", "pipe", "pipe"],
-    env: process.env,
+    env: launchEnv(opts.baseEnv ?? process.env),
     windowsHide: true,
   });
   const pgid = useGroup && typeof child.pid === "number" ? child.pid : undefined;
