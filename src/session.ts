@@ -29,7 +29,7 @@ const RPC_TIMEOUT_MS = 30_000;
 /** InitializeParams: both capability booleans are schema-defaulted to false; sent explicitly. */
 export function initializeParams(clientVersion: string): Record<string, unknown> {
   return {
-    clientInfo: { name: "codex-image-mcp", title: "codex-image-mcp", version: clientVersion },
+    clientInfo: { name: "codex-image-mcp", title: "codex-claude-bridge", version: clientVersion },
     capabilities: { experimentalApi: false, requestAttestation: false },
   };
 }

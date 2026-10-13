@@ -78,12 +78,14 @@ answers "not found" in exactly one of these two verified forms (exit 1, stdout e
 - **No MCP servers configured at all** (verified with Claude 2.1.293 in an isolated config
   directory), stderr exactly:
   ``No MCP server named "codex-image-mcp". Run `claude mcp add` to add one.``
-- **Other servers configured:** stderr starts with
-  `No MCP server named "codex-image-mcp". Configured servers:` and the list does not
-  contain `codex-image-mcp`.
+- **Other servers configured** (verified the same way), stderr is exactly one line
+  `No MCP server named "codex-image-mcp". Configured servers: ` followed by a non-empty,
+  comma-space-separated list of distinct plain server names (letters, digits, `-`, `_`)
+  that does not contain `codex-image-mcp`, e.g.
+  `No MCP server named "codex-image-mcp". Configured servers: alpha, beta-tools`.
 
-Anything else (warnings, output on both streams, other wording) is treated as
-inconclusive. The registered MCP name stays `codex-image-mcp` so existing setups keep
+Anything else (warnings, any stdout output, a bare or empty list, duplicate or unusual
+names, other wording) is treated as inconclusive; use the manual fallback then. The registered MCP name stays `codex-image-mcp` so existing setups keep
 working. The command it runs is:
 
 ```text

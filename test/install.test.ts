@@ -81,44 +81,73 @@ test("empty-config probe: only the exact verified claude 2.1.293 form is absent"
   assert.equal(classifyProbe({ status: 0, signal: null, stdout: "codex-image-mcp:\n  Scope: User config", stderr: "" }), "exists");
 });
 
-test("conflict probe: only the exact claude 2.1.293 not-found answer allows registering", () => {
-  // Fixture of the actual installed-CLI shape; the real configured-server list is not stored.
-  const actualNotFound = `No MCP server named "${SERVER_NAME}". Configured servers: alpha, beta-tools, ${SERVER_NAME}-old\n`;
-  // Actual subprocess capture: exit 1, stdout empty, not-found line on stderr.
+test("conflict probe: only the exact verified claude 2.1.293 configured-servers form allows registering", () => {
+  // Receipt: .harness-evidence/corrective-probe.json (isolated CLAUDE_CONFIG_DIR): exit 1,
+  // stdout empty, stderr exactly this single line.
+  const prefix = `No MCP server named "${SERVER_NAME}". Configured servers: `;
+  const actualNotFound = `${prefix}alpha, beta-tools, ${SERVER_NAME}-old\n`;
   assert.equal(classifyProbe({ status: 1, signal: null, stdout: "", stderr: actualNotFound }), "absent");
   assert.equal(classifyProbe({ status: 1, signal: null, stderr: actualNotFound }), "absent");
-  assert.equal(classifyProbe({ status: 1, signal: null, stdout: actualNotFound, stderr: "" }), "absent");
-  assert.equal(classifyProbe({ status: 1, signal: null, stdout: `No MCP server named "${SERVER_NAME}". Configured servers: \n` }), "absent");
+  assert.equal(classifyProbe({ status: 1, signal: null, stdout: "", stderr: `${prefix}alpha\n` }), "absent");
+  assert.equal(classifyProbe({ status: 1, signal: null, stdout: "", stderr: `${prefix}a_b, X9\n` }), "absent");
   // Exit 0 = exists in any scope (user, project, local); never overwritten.
   for (const scope of ["User", "Project", "Local"]) {
     assert.equal(classifyProbe({ status: 0, signal: null, stdout: `${SERVER_NAME}:\n  Scope: ${scope} config` }), "exists");
   }
   assert.equal(classifyProbe({ status: null, signal: null, error: { code: "ENOENT" } }), "cli_missing");
+  const err = (stderr: string, stdout = "") => ({ status: 1, signal: null, stdout, stderr });
   const inconclusive = [
     { status: null, signal: "SIGTERM" },
     { status: null, signal: null, error: { code: "ETIMEDOUT" } },
-    { status: 1, signal: null, stderr: "network error" },
+    err("network error"),
     // unverified older/other shapes
-    { status: 1, signal: null, stderr: `No MCP server found with name: "${SERVER_NAME}"` },
-    { status: 1, signal: null, stdout: `No MCP server found with name: "${SERVER_NAME}"` },
-    // other name, prefix not at start, wrong exit, noise on stderr, oversize
-    { status: 1, signal: null, stdout: 'No MCP server named "other-server". Configured servers: x' },
-    { status: 1, signal: null, stdout: `warning\n${actualNotFound}` },
-    { status: 1, signal: null, stdout: `No MCP server named "${SERVER_NAME}x". Configured servers: x` },
-    { status: 2, signal: null, stdout: actualNotFound },
-    { status: 1, signal: null, stdout: actualNotFound, stderr: "Error: config parse failed" },
-    // mixed: both streams non-empty, or nothing at all
-    { status: 1, signal: null, stdout: "warning", stderr: actualNotFound },
-    { status: 1, signal: null, stdout: actualNotFound, stderr: actualNotFound },
-    { status: 1, signal: null, stdout: "", stderr: "" },
-    { status: 1, signal: null, stderr: `warning\n${actualNotFound}` },
-    { status: 2, signal: null, stderr: actualNotFound },
-    { status: 1, signal: null, stdout: actualNotFound + "x".repeat(5000) },
-    { status: 1, signal: null, stderr: actualNotFound + "x".repeat(5000) },
-    { status: 1, signal: null, stderr: `No MCP server named "${SERVER_NAME}". Configured servers: alpha, ${SERVER_NAME}` },
-    // conflicting: claims not found but lists the exact name
-    { status: 1, signal: null, stdout: `No MCP server named "${SERVER_NAME}". Configured servers: alpha, ${SERVER_NAME}` },
-    { status: 1, signal: null, stdout: `No MCP server named "${SERVER_NAME}". Configured servers:\n  ${SERVER_NAME} (project)` },
+    err(`No MCP server found with name: "${SERVER_NAME}"`),
+    err("", `No MCP server found with name: "${SERVER_NAME}"`),
+    err(`No MCP server named "other-server". Configured servers: x\n`),
+    err(`No MCP server named "${SERVER_NAME}x". Configured servers: x\n`),
+    // stdout-only, or wrong exit
+    err("", actualNotFound),
+    { status: 2, signal: null, stdout: "", stderr: actualNotFound },
+    // mixed streams, including whitespace-only stdout
+    err(actualNotFound, "warning"),
+    err(actualNotFound, actualNotFound),
+    err(actualNotFound, " "),
+    err(actualNotFound, "\n"),
+    err("", ""),
+    err(" \n"),
+    // prepended/appended warnings, missing or extra newline, leading space, CRLF, oversize
+    err(`warning\n${actualNotFound}`),
+    err(`${actualNotFound}warning\n`),
+    err(`${actualNotFound}\n`),
+    err(actualNotFound.trimEnd()),
+    err(` ${actualNotFound}`),
+    err(actualNotFound.replace("\n", "\r\n")),
+    err(actualNotFound + "x".repeat(5000)),
+    // bare prefix and empty list
+    err(`No MCP server named "${SERVER_NAME}". Configured servers:\n`),
+    err(`No MCP server named "${SERVER_NAME}". Configured servers:`),
+    err(`${prefix}\n`),
+    err(`${prefix} \n`),
+    // contradictory: claims not found but lists the exact name
+    err(`${prefix}alpha, ${SERVER_NAME}\n`),
+    err(`${prefix}${SERVER_NAME}\n`),
+    err(`No MCP server named "${SERVER_NAME}". Configured servers:\n  ${SERVER_NAME} (project)\n`),
+    // duplicates and ambiguous / malformed entries, control characters
+    err(`${prefix}alpha, alpha\n`),
+    err(`${prefix}alpha,beta\n`),
+    err(`${prefix}alpha, \n`),
+    err(`${prefix}, alpha\n`),
+    err(`${prefix}alpha,  beta\n`),
+    err(`${prefix}alpha , beta\n`),
+    err(`${prefix}alpha, beta \n`),
+    err(`${prefix}alpha (project), beta\n`),
+    err(`${prefix}"alpha", beta\n`),
+    err(`${prefix}alpha\tbeta\n`),
+    err(`${prefix}alpha\u0000, beta\n`),
+    err(`${prefix}alpha\u001b[0m\n`),
+    err(`${prefix}-alpha\n`),
+    err(`${prefix}al.pha\n`),
+    err(`${prefix}${"a".repeat(65)}\n`),
   ];
-  for (const p of inconclusive) assert.equal(classifyProbe(p), "inconclusive", JSON.stringify(p).slice(0, 80));
+  for (const p of inconclusive) assert.equal(classifyProbe(p), "inconclusive", JSON.stringify(p).slice(0, 120));
 });

@@ -68,16 +68,25 @@ export type ProbeVerdict = "absent" | "exists" | "cli_missing" | "inconclusive";
 export const EMPTY_CONFIG_NOT_FOUND = `No MCP server named "${SERVER_NAME}". Run \`claude mcp add\` to add one.\n`;
 
 /**
- * Fail closed: "absent" only on exit 1 with either
- *  - stdout empty and stderr exactly EMPTY_CONFIG_NOT_FOUND, or
- *  - exactly one non-empty stream that starts with the exact not-found line
- *    observed from installed `claude` 2.1.293:
- *      No MCP server named "<name>". Configured servers: ...
- *    The actual CLI writes it to stderr (stdout empty); stdout-only is also
- *    accepted. The configured-server list is never stored; if it mentions the
- *    exact name again the answer is contradictory and treated as inconclusive.
- * Output on both streams is inconclusive. Exit 0 is an existing registration
- * in any scope. Anything else may hide one.
+ * Prefix of the configured-servers answer of `claude` 2.1.293, verified with an
+ * isolated CLAUDE_CONFIG_DIR (receipt .harness-evidence/corrective-probe.json):
+ * exit 1, stdout empty, stderr exactly one line
+ *   No MCP server named "<name>". Configured servers: alpha, beta-tools, <name>-old\n
+ */
+const CONFIGURED_SERVERS_PREFIX = `No MCP server named "${SERVER_NAME}". Configured servers: `;
+/** Conservative server identifier; anything else is not safely understood. */
+const SERVER_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+/**
+ * Fail closed: "absent" only on exit 1 with stdout byte-empty and stderr either
+ *  - exactly EMPTY_CONFIG_NOT_FOUND, or
+ *  - exactly CONFIGURED_SERVERS_PREFIX followed by a non-empty ", "-separated
+ *    list of distinct SERVER_ID names, none equal to SERVER_NAME, and a single
+ *    terminal "\n" (no other line breaks, whitespace or control characters).
+ * Stdout output, warnings, a bare or empty list, a list naming SERVER_NAME,
+ * duplicates or unrecognized names are inconclusive (manual fallback is safer
+ * than replacing a registration). Exit 0 is an existing registration in any
+ * scope. Anything else may hide one.
  */
 export function classifyProbe(p: ProbeResult): ProbeVerdict {
   if (p.error?.code === "ENOENT") return "cli_missing";
@@ -86,14 +95,12 @@ export function classifyProbe(p: ProbeResult): ProbeVerdict {
   if (p.status !== 1) return "inconclusive";
   const stdout = p.stdout ?? "";
   const stderr = p.stderr ?? "";
-  if (stdout === "" && stderr === EMPTY_CONFIG_NOT_FOUND) return "absent";
-  const outEmpty = stdout.trim() === "";
-  const errEmpty = stderr.trim() === "";
-  if (outEmpty === errEmpty) return "inconclusive";
-  const text = outEmpty ? stderr : stdout;
-  if (text.length > MAX_PROBE_TEXT) return "inconclusive";
-  const prefix = `No MCP server named "${SERVER_NAME}". Configured servers:`;
-  if (!text.startsWith(prefix)) return "inconclusive";
-  const exactName = new RegExp(`(^|[^\\w.-])${SERVER_NAME.replace(/[.-]/g, "\\$&")}($|[^\\w.-])`);
-  return exactName.test(text.slice(prefix.length)) ? "inconclusive" : "absent";
+  if (stdout !== "") return "inconclusive";
+  if (stderr === EMPTY_CONFIG_NOT_FOUND) return "absent";
+  if (stderr.length > MAX_PROBE_TEXT) return "inconclusive";
+  if (!stderr.startsWith(CONFIGURED_SERVERS_PREFIX) || !stderr.endsWith("\n")) return "inconclusive";
+  const names = stderr.slice(CONFIGURED_SERVERS_PREFIX.length, -1).split(", ");
+  if (!names.every((n) => SERVER_ID.test(n))) return "inconclusive";
+  if (new Set(names).size !== names.length || names.includes(SERVER_NAME)) return "inconclusive";
+  return "absent";
 }
