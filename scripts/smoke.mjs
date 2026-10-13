@@ -9,7 +9,9 @@
 // Starts the built MCP server over stdio with the official MCP SDK client,
 // exactly like Claude Code would. Each run gets its own git-ignored workspace
 // at .smoke/<uuid>/ (task cwd = .smoke/<uuid>/workspace, image output root =
-// .smoke/<uuid>/images). Evidence (sanitized tool results) is written to
+// .smoke/<uuid>/images for every mode, so no smoke run writes to the default
+// ~/codex-images). The image tool is always listed; status mode records the
+// resolved image_output. Evidence (sanitized tool results) is written to
 // .smoke/<uuid>/evidence.json. No retries: one tool call per job.
 //
 // write: two sequential codex_task_start jobs (each a new thread/process):
@@ -81,8 +83,8 @@ const readOrNull = (p) => {
 };
 const sha256 = (b) => (b === null ? null : createHash("sha256").update(b).digest("hex"));
 
-const env = { ...process.env, CODEX_TASK_WALL_SECONDS: "300" };
-if (mode === "image") env.CODEX_IMAGE_OUTPUT_ROOT = images;
+const env = { ...process.env, CODEX_TASK_WALL_SECONDS: "300", CODEX_IMAGE_OUTPUT_ROOT: images };
+const EXPECTED_TOOLS = ["codex_status", "codex_task_start", "codex_task_status", "codex_task_cancel", "codex_image_generate"];
 
 const transport = new StdioClientTransport({
   command: process.execPath,
@@ -107,9 +109,13 @@ let exitCode = 0;
 try {
   await client.connect(transport);
   const { tools } = await client.listTools();
-  record("list_tools", tools.map((t) => t.name));
+  const names = tools.map((t) => t.name);
+  record("list_tools", names);
+  if (JSON.stringify(names) !== JSON.stringify(EXPECTED_TOOLS)) exitCode = 1;
   if (mode === "status") {
-    record("codex_status", (await client.callTool({ name: "codex_status", arguments: {} })).structuredContent);
+    const s = (await client.callTool({ name: "codex_status", arguments: {} })).structuredContent;
+    record("codex_status", s);
+    if (s?.image_generate_enabled !== true || s?.image_output?.root !== images || s?.image_output?.source !== "env") exitCode = 1;
   } else if (mode === "write") {
     writeFileSync(SENTINEL, SENTINEL_BYTES, { mode: 0o600 });
     for (const s of WRITE_STEPS) {

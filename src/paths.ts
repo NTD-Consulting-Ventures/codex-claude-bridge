@@ -163,6 +163,37 @@ async function assertOwnedDir(dir: string): Promise<void> {
   }
 }
 
+/**
+ * Prepares the image output root before anything is written: every existing
+ * component from "/" must be a real directory (no symlinks) BEFORE the root is
+ * created, and the final root must be an owned, symlink-free directory.
+ * Missing components are created 0700 only after that pre-check.
+ */
+export async function prepareOwnedRoot(root: string): Promise<void> {
+  if (typeof root !== "string" || root.includes("\0") || !path.isAbsolute(root) || path.normalize(root) !== root || root === path.sep) {
+    throw new PathSecurityError("output root must be absolute, normalized and not /");
+  }
+  let cur: string = path.sep;
+  for (const part of root.split(path.sep).filter(Boolean)) {
+    cur = path.join(cur, part);
+    let st: Stats;
+    try {
+      st = await fsp.lstat(cur);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === "ENOENT") break;
+      throw new PathSecurityError("output root not accessible");
+    }
+    if (st.isSymbolicLink()) throw new PathSecurityError("symlink in path");
+    if (!st.isDirectory()) throw new PathSecurityError("output root component is not a directory");
+  }
+  try {
+    await fsp.mkdir(root, { recursive: true, mode: 0o700 });
+  } catch {
+    throw new PathSecurityError("output root could not be created");
+  }
+  await assertOwnedDir(root);
+}
+
 async function writeExclusive(dir: string, type: ImageType, bytes: Buffer): Promise<string> {
   await assertOwnedDir(dir);
   const dest = path.join(dir, `${randomUUID()}.${type === "png" ? "png" : "jpg"}`);

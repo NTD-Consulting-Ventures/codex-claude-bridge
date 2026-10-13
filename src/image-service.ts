@@ -1,9 +1,13 @@
-// Optional image convenience: verify a native Codex imageGeneration savedPath
-// and copy the bytes into an owned UUID subdirectory of CODEX_IMAGE_OUTPUT_ROOT.
+// Image saving: verify native Codex imageGeneration savedPaths and copy the
+// bytes into an owned UUID subdirectory of the resolved output root
+// (src/output-root.ts; default ~/codex-images).
 //
 // A turn that completes with text is NOT image success: success requires a
 // native imageGeneration item whose savedPath is a regular PNG/JPEG file under
-// the normal Codex home. Image editing is not exposed (unverified).
+// the normal Codex home. Any reported image item that is missing, unsupported
+// or unverifiable fails the job; none is silently dropped. Only native
+// savedPaths are read, never caller-supplied paths. Image editing is not
+// exposed (unverified).
 //
 // TOCTOU caveat: the checks in paths.ts (O_NOFOLLOW, lstat/fstat comparison,
 // no symlink components, single link) narrow but cannot fully eliminate races
@@ -13,10 +17,15 @@ import { randomUUID } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { copyVerifiedInputImage, PathSecurityError } from "./paths.js";
+import { copyVerifiedInputImage, PathSecurityError, prepareOwnedRoot } from "./paths.js";
 import { TaskError, type TurnOutcome } from "./session.js";
 
-export type ImageErrorCode = "OUTPUT_ROOT_NOT_CONFIGURED" | "NO_IMAGE_PRODUCED" | "IMAGE_VERIFICATION_FAILED";
+export type ImageErrorCode =
+  | "OUTPUT_ROOT_INVALID"
+  | "OUTPUT_ROOT_UNAVAILABLE"
+  | "NO_IMAGE_PRODUCED"
+  | "IMAGE_ITEM_INVALID"
+  | "IMAGE_VERIFICATION_FAILED";
 
 export class ImageError extends Error {
   constructor(readonly code: ImageErrorCode) {
@@ -29,12 +38,6 @@ export class ImageError extends Error {
 export function codexHome(env: NodeJS.ProcessEnv = process.env): string {
   const h = env.CODEX_HOME;
   return h && path.isAbsolute(h) ? path.normalize(h) : path.join(os.homedir(), ".codex");
-}
-
-export function outputRoot(env: NodeJS.ProcessEnv = process.env): string | null {
-  const r = env.CODEX_IMAGE_OUTPUT_ROOT;
-  if (!r || !path.isAbsolute(r) || path.normalize(r) !== r) return null;
-  return r;
 }
 
 export function buildImagePrompt(prompt: string): string {
@@ -80,9 +83,10 @@ function removeOwned(dir: string): () => Promise<void> {
 /**
  * Verifies every native imageGeneration savedPath (sequentially, at most
  * MAX_IMAGE_ITEMS from session.ts) and copies each into one owned UUID
- * subdirectory of `root`. Any verification failure fails the whole collection
- * and removes the owned subdirectory; in-flight filesystem work is always
- * awaited before cleanup.
+ * subdirectory of `root`. The root is validated (no symlink components,
+ * owned directory) before anything is created in it. Any verification failure
+ * fails the whole collection and removes the owned subdirectory; in-flight
+ * filesystem work is always awaited before cleanup.
  */
 export async function collectImages(
   savedPaths: readonly string[],
@@ -95,9 +99,14 @@ export async function collectImages(
   const dir = path.join(root, randomUUID());
   let created = false;
   try {
-    await fsp.mkdir(root, { recursive: true, mode: 0o700 });
-    hooks.checkpoint?.();
-    await fsp.mkdir(dir, { mode: 0o700 });
+    try {
+      await prepareOwnedRoot(root);
+      hooks.checkpoint?.();
+      await fsp.mkdir(dir, { mode: 0o700 });
+    } catch (e) {
+      if (e instanceof TaskError) throw e;
+      throw new ImageError("OUTPUT_ROOT_UNAVAILABLE");
+    }
     created = true;
     hooks.own?.(removeOwned(dir));
     await hooks.afterStep?.("mkdir");
@@ -121,12 +130,27 @@ export async function collectImages(
   }
 }
 
+/**
+ * Native savedPaths of a turn's imageGeneration items, deduplicated. Throws
+ * IMAGE_ITEM_INVALID when any item lacks a savedPath, is not completed, or
+ * items beyond the session bound were dropped.
+ */
+export function nativeSavedPaths(outcome: TurnOutcome): string[] {
+  if (outcome.imagesOverflow) throw new ImageError("IMAGE_ITEM_INVALID");
+  const out: string[] = [];
+  for (const i of outcome.images) {
+    if (i.savedPath === null || i.status !== "completed") throw new ImageError("IMAGE_ITEM_INVALID");
+    if (!out.includes(i.savedPath)) out.push(i.savedPath);
+  }
+  return out;
+}
+
+/** Collects every native image of the turn; fails when there is none. */
 export async function collectImage(
   outcome: TurnOutcome,
   root: string,
   allowedSourceRoots: readonly string[] = [codexHome()],
   hooks: CollectHooks = {},
 ): Promise<ImageFile[]> {
-  const saved = outcome.images.flatMap((i) => (i.savedPath !== null ? [i.savedPath] : []));
-  return collectImages(saved, root, allowedSourceRoots, hooks);
+  return collectImages(nativeSavedPaths(outcome), root, allowedSourceRoots, hooks);
 }

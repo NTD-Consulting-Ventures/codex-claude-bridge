@@ -2,7 +2,11 @@
 // Trusted-local Codex delegation MCP server (stdio).
 //
 // Tools: codex_status, codex_task_start, codex_task_status, codex_task_cancel
-// and, when CODEX_IMAGE_OUTPUT_ROOT is configured, codex_image_generate.
+// and codex_image_generate. Native images are copied into the output root
+// resolved once by src/output-root.ts (default ~/codex-images); an invalid
+// explicit CODEX_IMAGE_OUTPUT_ROOT makes job starts fail with
+// OUTPUT_ROOT_INVALID before any job begins. The output root is written by
+// this process only; it is never added to Codex's writable roots.
 // Inputs are strictly validated; the only free-form value forwarded to Codex
 // is the delegated prompt. No model/config/URL/shell parameters exist.
 
@@ -12,10 +16,11 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { pathToFileURL } from "node:url";
 import type { CodexTransport } from "./codex-client.js";
 import { CwdError, validateCwd } from "./cwd.js";
-import { buildImagePrompt, codexHome, collectImage, ImageError, outputRoot, type CollectHooks, type ImageFile, type ImageResult } from "./image-service.js";
+import { buildImagePrompt, codexHome, collectImage, ImageError, type CollectHooks, type ImageFile, type ImageResult } from "./image-service.js";
 import { DEFAULT_WALL_MS, JobManager, MAX_WALL_MS, throwIfAborted } from "./jobs.js";
+import { resolveOutputRoot, type OutputRootResolution } from "./output-root.js";
 import { resolveCodexBin, spawnAppServer, terminateAllAppServers } from "./process-transport.js";
-import { runDelegatedTurn, TaskError } from "./session.js";
+import { runDelegatedTurn, TaskError, type TurnOutcome } from "./session.js";
 import { codexVersion, getStatus, SERVER_VERSION, type CapabilityProbe, type VersionProbe } from "./status.js";
 
 export const MAX_PROMPT_CHARS = 32_000;
@@ -56,7 +61,9 @@ export const TOOLS = {
       "Runs with native sandbox workspace-write bounded to cwd (only writable root; no network; /tmp and $TMPDIR " +
       "excluded) and approvals on-request: Codex may create and modify files inside cwd without approval. Any " +
       "elevated approval request (outside-root write, network, escalation) fails the job with APPROVAL_REQUIRED. " +
-      "One active job at a time. Returns a job_id; poll codex_task_status.",
+      "One active job at a time. Returns a job_id; poll codex_task_status. Succeeded result: {text, text_truncated, " +
+      "image_items, files:[{path, mime_type, bytes, sha256}]}; files holds every verified native generated image " +
+      "copied into the image output root (empty when none). An unverifiable image item fails the job.",
     inputSchema: promptCwd,
     // Conservative: delegated Codex runs with the user's normal config/plugins/MCP servers.
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -77,7 +84,8 @@ export const TOOLS = {
     name: "codex_image_generate",
     description:
       "Start a job asking Codex to generate one image natively. Success only if a native imageGeneration item " +
-      "yields a verified PNG/JPEG, copied into a UUID subdirectory of CODEX_IMAGE_OUTPUT_ROOT. Succeeded result: " +
+      "yields a verified PNG/JPEG, copied into a UUID subdirectory of the image output root (default ~/codex-images; " +
+      "see codex_status image_output). Succeeded result: " +
       "{job_id, files:[{path, mime_type, bytes, sha256}], codex_version}. Same cwd-bounded workspace-write policy " +
       "as codex_task_start. May consume quota; never retried.",
     inputSchema: promptCwd,
@@ -133,9 +141,12 @@ export class ToolHandler {
   readonly jobs: JobManager;
   private readonly env: NodeJS.ProcessEnv;
   private readonly createTransport: (cwd: string) => CodexTransport;
+  /** Resolved once so status, listing and every job use the same root. */
+  readonly outputRoot: OutputRootResolution;
 
   constructor(private readonly deps: ServerDeps = {}) {
     this.env = deps.env ?? process.env;
+    this.outputRoot = resolveOutputRoot(this.env);
     this.jobs = new JobManager(deps.wallMs ?? wallFromEnv(this.env));
     this.createTransport =
       deps.createTransport ??
@@ -146,21 +157,16 @@ export class ToolHandler {
       });
   }
 
-  get imageEnabled(): boolean {
-    return outputRoot(this.env) !== null;
-  }
-
+  /** Always listed; an invalid output root is reported by codex_status and job starts, never hidden. */
   listTools(): (typeof TOOLS)[keyof typeof TOOLS][] {
-    const t = [TOOLS.codex_status, TOOLS.codex_task_start, TOOLS.codex_task_status, TOOLS.codex_task_cancel];
-    if (this.imageEnabled) t.push(TOOLS.codex_image_generate);
-    return t;
+    return [TOOLS.codex_status, TOOLS.codex_task_start, TOOLS.codex_task_status, TOOLS.codex_task_cancel, TOOLS.codex_image_generate];
   }
 
   async call(name: string, args: unknown): Promise<ToolResult> {
     switch (name) {
       case "codex_status": {
         if (!exactKeys(args, [])) return err("INVALID_ARGUMENTS", "codex_status accepts no arguments.");
-        const s = await getStatus(this.deps.versionProbe, this.deps.capabilityProbe, this.imageEnabled);
+        const s = await getStatus(this.deps.versionProbe, this.deps.capabilityProbe, this.outputRoot);
         return ok({ ...s, active_job_id: this.jobs.active ?? null });
       }
       case "codex_task_start":
@@ -190,10 +196,9 @@ export class ToolHandler {
     if (!a || typeof a.prompt !== "string" || a.prompt.trim().length === 0 || a.prompt.length > MAX_PROMPT_CHARS) {
       return err("INVALID_ARGUMENTS", `Expected {prompt (1..${MAX_PROMPT_CHARS} chars), cwd}.`);
     }
-    const root = outputRoot(this.env);
-    if (name === "codex_image_generate" && root === null) {
-      return err("OUTPUT_ROOT_NOT_CONFIGURED", "Set CODEX_IMAGE_OUTPUT_ROOT to an absolute normalized path.");
-    }
+    // Both tools may save images; an invalid root fails before any job begins.
+    if (!this.outputRoot.ok) return err("OUTPUT_ROOT_INVALID", this.outputRoot.message);
+    const root = this.outputRoot.path;
     let cwd: string;
     try {
       cwd = await validateCwd(a.cwd);
@@ -211,22 +216,28 @@ export class ToolHandler {
         createTransport: this.createTransport,
         clientVersion: SERVER_VERSION,
       });
-      if (name === "codex_task_start") {
-        return { text: outcome.text, text_truncated: outcome.textTruncated, image_items: outcome.images.length };
-      }
       // Post-processing stays inside the job deadline/cancellation: every
       // await completes (no abandoned writes), the signal is checked between
       // awaits, and the owned output dir is removed by JobManager on failure.
       const checkpoint = (): void => throwIfAborted(signal);
-      checkpoint();
-      let files: ImageFile[];
-      try {
-        files = await collectImage(outcome, root as string, [codexHome(this.env)], { checkpoint, own, afterStep: this.deps.imageAfterStep });
-      } catch (e) {
-        if (e instanceof ImageError) throw new TaskError(e.code);
-        throw e;
+      const collect = async (o: TurnOutcome): Promise<ImageFile[]> => {
+        checkpoint();
+        let files: ImageFile[];
+        try {
+          files = await collectImage(o, root, [codexHome(this.env)], { checkpoint, own, afterStep: this.deps.imageAfterStep });
+        } catch (e) {
+          if (e instanceof ImageError) throw new TaskError(e.code);
+          throw e;
+        }
+        checkpoint();
+        return files;
+      };
+      if (name === "codex_task_start") {
+        const noImages = outcome.images.length === 0 && !outcome.imagesOverflow;
+        const files = noImages ? [] : await collect(outcome);
+        return { text: outcome.text, text_truncated: outcome.textTruncated, image_items: outcome.images.length, files };
       }
-      checkpoint();
+      const files = await collect(outcome);
       const version = await codexVersion(this.deps.versionProbe);
       checkpoint();
       const result: ImageResult = { job_id: jobId, files, codex_version: version };
@@ -319,7 +330,7 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch(() => {
-    process.stderr.write("codex-image-mcp: failed to start\n");
+    process.stderr.write("codex-claude-bridge: failed to start\n");
     process.exit(1);
   });
 }

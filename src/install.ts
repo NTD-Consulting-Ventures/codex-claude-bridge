@@ -3,6 +3,7 @@
 // script. ~/.claude.json is never read or written.
 
 import path from "node:path";
+import { resolveOutputRoot } from "./output-root.js";
 import { resolveCodexBin } from "./process-transport.js";
 
 export const SERVER_NAME = "codex-image-mcp";
@@ -29,14 +30,16 @@ export function resolveRegisteredCodexBin(env: NodeJS.ProcessEnv): BinChoice {
   return { ok: true, path: r.path, source: r.source };
 }
 
-export type RootChoice = { ok: true; path: string | null } | { ok: false; reason: string };
+export type RootChoice = { ok: true; path: string; source: "default" | "env" } | { ok: false; reason: string };
 
-/** CODEX_IMAGE_OUTPUT_ROOT forwarded via `-e` to enable the image tool. Unset → null; set-but-invalid fails closed. */
-export function resolveRegisteredOutputRoot(env: NodeJS.ProcessEnv): RootChoice {
-  const raw = env.CODEX_IMAGE_OUTPUT_ROOT;
-  if (raw === undefined || raw === "") return { ok: true, path: null };
-  if (!absoluteNormalized(raw) || raw === "/") return { ok: false, reason: "CODEX_IMAGE_OUTPUT_ROOT must be an absolute normalized path other than /" };
-  return { ok: true, path: raw };
+/**
+ * Image output root forwarded via `-e`, resolved by the same resolver the
+ * server uses (src/output-root.ts): unset → ~/codex-images; set-but-invalid
+ * (including empty) fails closed.
+ */
+export function resolveRegisteredOutputRoot(env: NodeJS.ProcessEnv, homedir?: () => string): RootChoice {
+  const r = resolveOutputRoot(env, homedir);
+  return r.ok ? { ok: true, path: r.path, source: r.source } : { ok: false, reason: r.message };
 }
 
 export function addArgs(node: string, serverJs: string, codex: BinChoice & { ok: true }, outputRoot: string | null = null): string[] {
@@ -58,14 +61,23 @@ export interface ProbeResult {
 export type ProbeVerdict = "absent" | "exists" | "cli_missing" | "inconclusive";
 
 /**
- * Fail closed: "absent" only on exit 1 with exactly one non-empty stream that
- * starts with the exact not-found line observed from installed `claude` 2.1.293:
- *   No MCP server named "<name>". Configured servers: ...
- * The actual CLI writes it to stderr (stdout empty); stdout-only is also
- * accepted. Output on both streams is inconclusive. The configured-server list
- * is never stored; if it mentions the exact name again the answer is
- * contradictory and treated as inconclusive. Exit 0 is an existing
- * registration in any scope. Anything else may hide one.
+ * Exact empty-config answer of `claude` 2.1.293 (no MCP servers configured at
+ * all), verified with an isolated CLAUDE_CONFIG_DIR: exit 1, stdout empty,
+ * stderr exactly this text. Only this byte-exact form is accepted.
+ */
+export const EMPTY_CONFIG_NOT_FOUND = `No MCP server named "${SERVER_NAME}". Run \`claude mcp add\` to add one.\n`;
+
+/**
+ * Fail closed: "absent" only on exit 1 with either
+ *  - stdout empty and stderr exactly EMPTY_CONFIG_NOT_FOUND, or
+ *  - exactly one non-empty stream that starts with the exact not-found line
+ *    observed from installed `claude` 2.1.293:
+ *      No MCP server named "<name>". Configured servers: ...
+ *    The actual CLI writes it to stderr (stdout empty); stdout-only is also
+ *    accepted. The configured-server list is never stored; if it mentions the
+ *    exact name again the answer is contradictory and treated as inconclusive.
+ * Output on both streams is inconclusive. Exit 0 is an existing registration
+ * in any scope. Anything else may hide one.
  */
 export function classifyProbe(p: ProbeResult): ProbeVerdict {
   if (p.error?.code === "ENOENT") return "cli_missing";
@@ -74,6 +86,7 @@ export function classifyProbe(p: ProbeResult): ProbeVerdict {
   if (p.status !== 1) return "inconclusive";
   const stdout = p.stdout ?? "";
   const stderr = p.stderr ?? "";
+  if (stdout === "" && stderr === EMPTY_CONFIG_NOT_FOUND) return "absent";
   const outEmpty = stdout.trim() === "";
   const errEmpty = stderr.trim() === "";
   if (outEmpty === errEmpty) return "inconclusive";

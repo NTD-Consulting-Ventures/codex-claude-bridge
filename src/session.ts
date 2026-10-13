@@ -207,8 +207,10 @@ export type TaskErrorCode =
   | "OUTPUT_LIMIT"
   | "SPAWN_FAILED"
   | "NO_IMAGE_PRODUCED"
+  | "IMAGE_ITEM_INVALID"
   | "IMAGE_VERIFICATION_FAILED"
-  | "OUTPUT_ROOT_NOT_CONFIGURED";
+  | "OUTPUT_ROOT_INVALID"
+  | "OUTPUT_ROOT_UNAVAILABLE";
 
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
@@ -264,6 +266,8 @@ export interface TurnOutcome {
   text: string;
   textTruncated: boolean;
   images: ImageItem[];
+  /** True when imageGeneration items beyond MAX_IMAGE_ITEMS were seen (and not kept). */
+  imagesOverflow: boolean;
 }
 
 export interface RunOptions {
@@ -360,6 +364,7 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
   let textBytes = 0;
   let textTruncated = false;
   const images: ImageItem[] = [];
+  let imagesOverflow = false;
   let retriedErrors = 0;
   let lastFatalError: TurnErrorSummary | undefined;
 
@@ -396,7 +401,11 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
         }
         textBytes += n;
         agentTexts.set(item.id, item.text);
-      } else if (item.type === "imageGeneration" && images.length < MAX_IMAGE_ITEMS) {
+      } else if (item.type === "imageGeneration") {
+        if (images.length >= MAX_IMAGE_ITEMS) {
+          imagesOverflow = true;
+          return;
+        }
         images.push({
           savedPath: typeof item.savedPath === "string" ? item.savedPath : null,
           status: typeof item.status === "string" ? item.status.slice(0, 64) : "unknown",
@@ -475,7 +484,7 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     }
     if (done.status === "interrupted") throw new TaskError("TURN_INTERRUPTED");
     if (done.status !== "completed") throw new TaskError("PROTOCOL_ERROR");
-    return { text: [...agentTexts.values()].join("\n\n"), textTruncated, images };
+    return { text: [...agentTexts.values()].join("\n\n"), textTruncated, images, imagesOverflow };
   } catch (e) {
     const err = pendingFailure ?? fromClientError(e, phase);
     // Best-effort interrupt of an in-flight turn, then terminate the process.

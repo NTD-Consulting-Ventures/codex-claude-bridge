@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import os from "node:os";
 import { CodexClientError, CodexRpcClient, type CodexTransport } from "./codex-client.js";
+import { resolveOutputRoot, type OutputRootInvalidReason, type OutputRootResolution } from "./output-root.js";
 import { resolveCodexBin, spawnAppServer } from "./process-transport.js";
 import { APPROVAL_POLICY, APPROVALS_REVIEWER, initializeParams, SANDBOX_MODE } from "./session.js";
 
@@ -12,7 +13,7 @@ const MAX_LISTED = 100;
 const MCP_PAGE_LIMIT = 50;
 const MAX_MCP_PAGES = 4;
 const MAX_CURSOR_CHARS = 1024;
-export const SERVER_VERSION = "0.1.0";
+export const SERVER_VERSION = "0.2.0";
 
 export interface VersionProbeResult {
   ok: boolean;
@@ -286,15 +287,30 @@ export interface CodexStatus {
   };
   plugins: Listing<PluginSummary>;
   mcp_servers: Listing<McpServerSummary>;
+  /** True only when the output root configuration is valid. */
   image_generate_enabled: boolean;
+  image_output: ImageOutputStatus;
   image_edit_enabled: false;
   note: string;
+}
+
+/** Resolved image output root (configuration only; the filesystem is checked per job before writing). */
+export interface ImageOutputStatus {
+  root: string | null;
+  source: "default" | "env";
+  error: { code: "OUTPUT_ROOT_INVALID"; reason: OutputRootInvalidReason; message: string } | null;
+}
+
+export function imageOutputStatus(r: OutputRootResolution): ImageOutputStatus {
+  return r.ok
+    ? { root: r.path, source: r.source, error: null }
+    : { root: null, source: r.source, error: { code: "OUTPUT_ROOT_INVALID", reason: r.reason, message: r.message } };
 }
 
 export async function getStatus(
   probe: VersionProbe = probeCodexVersion,
   capabilities: CapabilityProbe = probeCapabilities,
-  imageEnabled = false,
+  outputRoot: OutputRootResolution = resolveOutputRoot(),
 ): Promise<CodexStatus> {
   const version = await codexVersion(probe);
   let caps: CapabilityProbeResult;
@@ -324,7 +340,8 @@ export async function getStatus(
     },
     plugins: caps.plugins,
     mcp_servers: caps.mcp_servers,
-    image_generate_enabled: imageEnabled,
+    image_generate_enabled: outputRoot.ok,
+    image_output: imageOutputStatus(outputRoot),
     image_edit_enabled: false,
     note:
       "Trusted-local capability, not a security boundary: delegated prompts run as a general Codex agent " +

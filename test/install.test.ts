@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { addArgs, classifyProbe, resolveClaudeBin, resolveRegisteredCodexBin, resolveRegisteredOutputRoot, SERVER_NAME } from "../src/install.js";
+import { addArgs, classifyProbe, EMPTY_CONFIG_NOT_FOUND, resolveClaudeBin, resolveRegisteredCodexBin, resolveRegisteredOutputRoot, SERVER_NAME } from "../src/install.js";
 
 test("CLAUDE_BIN / CODEX_BIN: absolute normalized paths accepted, anything else fails closed", () => {
   assert.deepEqual(resolveClaudeBin({}), { ok: true, path: "claude", source: "default" });
@@ -41,13 +41,44 @@ test("add argv: name precedes every -e (claude 2.1.293 -e is variadic), then -- 
   ]);
 });
 
-test("CODEX_IMAGE_OUTPUT_ROOT is forwarded only when set and absolute; invalid fails closed", () => {
-  assert.deepEqual(resolveRegisteredOutputRoot({}), { ok: true, path: null });
-  assert.deepEqual(resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: "/Users/u/img" }), { ok: true, path: "/Users/u/img" });
-  for (const bad of ["img", "./img", "/a/../img", "/a//img", "/", "/a\0b"]) {
-    assert.equal(resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: bad }).ok, false, bad);
+test("resolved output root (default or override) is forwarded consistently; invalid (incl. empty) fails closed", () => {
+  const head = ["mcp", "add", "--transport", "stdio", "--scope", "user", "codex-image-mcp"];
+  const codexEnv = { ok: true as const, path: "/c", source: "env" as const };
+  const def = resolveRegisteredOutputRoot({}, () => "/Users/u");
+  assert.deepEqual(def, { ok: true, path: "/Users/u/codex-images", source: "default" });
+  const ovr = resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: "/Users/u/img" });
+  assert.deepEqual(ovr, { ok: true, path: "/Users/u/img", source: "env" });
+  for (const r of [def, ovr]) {
+    assert.ok(r.ok);
+    // Name stays before every variadic -e.
+    assert.deepEqual(addArgs("/n", "/s.js", codexEnv, r.path), [...head, "-e", "CODEX_BIN=/c", "-e", `CODEX_IMAGE_OUTPUT_ROOT=${r.path}`, "--", "/n", "/s.js"]);
   }
-  assert.ok(!addArgs("/n", "/s.js", { ok: true, path: "/c", source: "default" }).some((x) => x.startsWith("CODEX_IMAGE_OUTPUT_ROOT=")));
+  for (const bad of ["", "img", "./img", "/a/../img", "/a//img", "/img/", "/", "/a\0b"]) {
+    assert.equal(resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: bad }).ok, false, JSON.stringify(bad));
+  }
+});
+
+test("empty-config probe: only the exact verified claude 2.1.293 form is absent", () => {
+  // Receipt: .harness-evidence/empty-config-probe.json (isolated CLAUDE_CONFIG_DIR).
+  const exact = 'No MCP server named "codex-image-mcp". Run `claude mcp add` to add one.\n';
+  assert.equal(EMPTY_CONFIG_NOT_FOUND, exact);
+  assert.equal(classifyProbe({ status: 1, signal: null, stdout: "", stderr: exact }), "absent");
+  const bad = [
+    { status: 1, signal: null, stdout: exact, stderr: "" },
+    { status: 1, signal: null, stdout: "x", stderr: exact },
+    { status: 1, signal: null, stdout: "", stderr: `warning\n${exact}` },
+    { status: 1, signal: null, stdout: "", stderr: `${exact}warning\n` },
+    { status: 1, signal: null, stdout: "", stderr: exact.trimEnd() },
+    { status: 1, signal: null, stdout: "", stderr: exact + "\n" },
+    { status: 1, signal: null, stdout: "", stderr: " " + exact },
+    { status: 1, signal: null, stdout: "", stderr: exact.replace("codex-image-mcp", "other") },
+    { status: 1, signal: null, stdout: "", stderr: exact.replace("Run", "run") },
+    { status: 2, signal: null, stdout: "", stderr: exact },
+    { status: null, signal: "SIGTERM", stdout: "", stderr: exact },
+    { status: 1, signal: null, error: { code: "ETIMEDOUT" }, stdout: "", stderr: exact },
+  ];
+  for (const p of bad) assert.equal(classifyProbe(p), "inconclusive", JSON.stringify(p).slice(0, 120));
+  assert.equal(classifyProbe({ status: 0, signal: null, stdout: "codex-image-mcp:\n  Scope: User config", stderr: "" }), "exists");
 });
 
 test("conflict probe: only the exact claude 2.1.293 not-found answer allows registering", () => {
