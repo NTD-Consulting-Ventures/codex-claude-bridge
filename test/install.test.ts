@@ -16,12 +16,29 @@ test("CLAUDE_BIN / CODEX_BIN: absolute normalized paths accepted, anything else 
   assert.equal((resolveRegisteredCodexBin({}) as { source?: string }).source, "default");
 });
 
-test("add argv forwards CODEX_BIN only when explicitly set; name precedes the -- separator", () => {
-  const env = addArgs("/usr/local/bin/node", "/r/dist/src/server.js", { ok: true, path: "/x/codex", source: "env" });
-  assert.deepEqual(env, ["mcp", "add", "--transport", "stdio", "--scope", "user", "-e", "CODEX_BIN=/x/codex", SERVER_NAME, "--", "/usr/local/bin/node", "/r/dist/src/server.js"]);
-  const def = addArgs("/n", "/s.js", { ok: true, path: "/h/.local/bin/codex", source: "default" });
-  assert.ok(!def.includes("-e"));
-  assert.equal(def.indexOf(SERVER_NAME) + 1, def.indexOf("--"));
+test("add argv: name precedes every -e (claude 2.1.293 -e is variadic), then -- node server", () => {
+  // Paths with spaces must stay single argv tokens.
+  const node = "/Users/u/My Tools/node";
+  const server = "/Users/u/My Code/codex-image-mcp/dist/src/server.js";
+  const codexEnv = { ok: true as const, path: "/Users/u/Codex Bin/codex", source: "env" as const };
+  const codexDef = { ok: true as const, path: "/Users/u/.local/bin/codex", source: "default" as const };
+  const root = "/Users/u/Codex Images";
+  const head = ["mcp", "add", "--transport", "stdio", "--scope", "user", "codex-image-mcp"];
+  assert.equal(SERVER_NAME, "codex-image-mcp");
+  // neither
+  assert.deepEqual(addArgs(node, server, codexDef), [...head, "--", node, server]);
+  assert.deepEqual(addArgs(node, server, codexDef, null), [...head, "--", node, server]);
+  // CODEX_BIN only
+  assert.deepEqual(addArgs(node, server, codexEnv), [...head, "-e", "CODEX_BIN=/Users/u/Codex Bin/codex", "--", node, server]);
+  // output root only
+  assert.deepEqual(addArgs(node, server, codexDef, root), [...head, "-e", "CODEX_IMAGE_OUTPUT_ROOT=/Users/u/Codex Images", "--", node, server]);
+  // both
+  assert.deepEqual(addArgs(node, server, codexEnv, root), [
+    ...head,
+    "-e", "CODEX_BIN=/Users/u/Codex Bin/codex",
+    "-e", "CODEX_IMAGE_OUTPUT_ROOT=/Users/u/Codex Images",
+    "--", node, server,
+  ]);
 });
 
 test("CODEX_IMAGE_OUTPUT_ROOT is forwarded only when set and absolute; invalid fails closed", () => {
@@ -30,8 +47,6 @@ test("CODEX_IMAGE_OUTPUT_ROOT is forwarded only when set and absolute; invalid f
   for (const bad of ["img", "./img", "/a/../img", "/a//img", "/", "/a\0b"]) {
     assert.equal(resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: bad }).ok, false, bad);
   }
-  const a = addArgs("/n", "/s.js", { ok: true, path: "/x/codex", source: "env" }, "/Users/u/img");
-  assert.deepEqual(a.slice(6), ["-e", "CODEX_BIN=/x/codex", "-e", "CODEX_IMAGE_OUTPUT_ROOT=/Users/u/img", SERVER_NAME, "--", "/n", "/s.js"]);
   assert.ok(!addArgs("/n", "/s.js", { ok: true, path: "/c", source: "default" }).some((x) => x.startsWith("CODEX_IMAGE_OUTPUT_ROOT=")));
 });
 

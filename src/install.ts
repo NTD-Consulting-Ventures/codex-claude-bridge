@@ -42,7 +42,9 @@ export function resolveRegisteredOutputRoot(env: NodeJS.ProcessEnv): RootChoice 
 export function addArgs(node: string, serverJs: string, codex: BinChoice & { ok: true }, outputRoot: string | null = null): string[] {
   const env = codex.source === "env" ? ["-e", `CODEX_BIN=${codex.path}`] : [];
   if (outputRoot !== null) env.push("-e", `CODEX_IMAGE_OUTPUT_ROOT=${outputRoot}`);
-  return ["mcp", "add", "--transport", "stdio", "--scope", "user", ...env, SERVER_NAME, "--", node, serverJs];
+  // Name must precede -e: claude 2.1.293 parses -e as variadic, so a name placed
+  // after the last -e is swallowed as another env entry.
+  return ["mcp", "add", "--transport", "stdio", "--scope", "user", SERVER_NAME, ...env, "--", node, serverJs];
 }
 
 export interface ProbeResult {
