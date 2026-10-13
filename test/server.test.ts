@@ -12,7 +12,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { MAX_COMPLETED_JOBS } from "../src/jobs.js";
 import { createServer, installShutdownHandlers, makeShutdown, ToolHandler, TOOLS, wallFromEnv, type ServerDeps } from "../src/server.js";
 import { getStatus, probeCapabilities, sanitizeVersion, summarizeMcpServers, summarizePlugins } from "../src/status.js";
-import { agentMessage, completingScript, defaultReply, FakeAppServer, THREAD_ID, TURN_ID, turnCompleted } from "./fake-app-server.js";
+import { agentMessage, completingScript, defaultReply, FakeAppServer, THREAD_ID, threadStartResult, TURN_ID, turnCompleted } from "./fake-app-server.js";
 
 const okProbe = async () => ({ ok: true, stdout: "codex-cli 0.156.0\n" });
 const caps = async () => ({
@@ -65,10 +65,20 @@ test("codex_status reports version, policy and plugin names", async () => {
   const r = await handler().call("codex_status", {});
   const s = r.structuredContent as Record<string, any>;
   assert.equal(s.codex_cli_version, "0.156.0");
-  assert.deepEqual(s.launch, { approval_policy: "on-request", sandbox: "read-only", experimental_api: false });
+  assert.deepEqual(s.launch, {
+    approval_policy: "on-request",
+    approvals_reviewer: "user",
+    sandbox: "workspace-write",
+    writable_roots: "task_cwd_only",
+    network_access: false,
+    temp_dirs_writable: false,
+    experimental_api: false,
+  });
   assert.deepEqual(s.plugins.items, [{ name: "demo", enabled: true, installed: true }]);
   assert.equal(s.mcp_servers.available, false);
   assert.match(s.note, /not a security boundary/);
+  assert.match(s.note, /workspace-write/);
+  assert.doesNotMatch(s.note, /read-only/);
   assert.equal((await handler().call("codex_status", { x: 1 })).isError, true);
 });
 
@@ -206,6 +216,43 @@ test("validated cwd reaches the transport factory; thread/start rpc error surfac
     diagnostic: { phase: "thread_start", rpc_code: -32602, rpc_class: "invalid_params", message_class: "missing_field", field: "cwd" },
   });
   assert.ok(!JSON.stringify(done).includes("/Users/x"));
+});
+
+test("task tool description states the bounded workspace-write policy, not read-only", () => {
+  const d = TOOLS.codex_task_start.description;
+  assert.match(d, /workspace-write/);
+  assert.match(d, /APPROVAL_REQUIRED/);
+  assert.doesNotMatch(d, /read-only/);
+});
+
+test("ambient writable root in the effective thread policy fails the job with POLICY_MISMATCH and no turn", async () => {
+  const cwd = tmp();
+  const fake = new FakeAppServer({
+    onRequest(msg) {
+      if (msg.method === "thread/start") return { result: threadStartResult(msg.params?.cwd, {}, { writableRoots: [msg.params?.cwd, "/Users/x/SECRET"] }) };
+      return defaultReply(msg);
+    },
+  });
+  const h = handler({ createTransport: () => fake });
+  const { job_id } = (await h.call("codex_task_start", { prompt: "x", cwd })).structuredContent as { job_id: string };
+  const done = await waitDone(h, job_id);
+  assert.equal(done.state, "failed");
+  assert.deepEqual(done.error, { code: "POLICY_MISMATCH", diagnostic: { phase: "thread_start", policy_mismatch: "writable_roots" } });
+  assert.ok(!JSON.stringify(done).includes("SECRET"));
+  assert.ok(!fake.methods().includes("turn/start"));
+});
+
+test("validated canonical cwd is sent as thread cwd, turn cwd and the only writable root", async () => {
+  const cwd = tmp();
+  const fake = new FakeAppServer(completingScript([turnCompleted()]));
+  const h = handler({ createTransport: () => fake });
+  const { job_id } = (await h.call("codex_task_start", { prompt: "x", cwd })).structuredContent as { job_id: string };
+  assert.equal((await waitDone(h, job_id)).state, "succeeded");
+  const ts = fake.received.find((m) => m.method === "thread/start")!.params!;
+  const tr = fake.received.find((m) => m.method === "turn/start")!.params!;
+  assert.equal(ts.cwd, cwd);
+  assert.equal(tr.cwd, cwd);
+  assert.deepEqual((tr.sandboxPolicy as { writableRoots: unknown }).writableRoots, [cwd]);
 });
 
 test("single active job; cancel; argument and cwd validation", async () => {

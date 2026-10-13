@@ -10,6 +10,10 @@
 // (src/model-select.ts; fails with MODEL_UNAVAILABLE, no fallback). Without a flag no turn is started and nothing is
 // generated. Output goes to stdout only; nothing is written to disk.
 //
+// thread_start reports the effective ThreadStartResponse policy as fixed
+// enums/booleans/counts only (no paths) and the same threadPolicyMismatch()
+// verdict the server uses; on a mismatch no turn is started.
+//
 // --task-error starts exactly ONE no-tools "reply PONG" turn: no retry, no
 // image, no config overrides, no config/auth file reads. Any server-initiated
 // request (approval, plugin/MCP elicitation, tool call) is denied and ends the
@@ -23,7 +27,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CodexClientError, CodexRpcClient } from "../dist/src/codex-client.js";
 import { resolveCodexBin, spawnAppServer, terminateAllAppServers } from "../dist/src/process-transport.js";
-import { initializeParams, requestKind, summarizeTurnError, threadStartParams, turnStartParams } from "../dist/src/session.js";
+import {
+  initializeParams,
+  requestKind,
+  summarizeTurnError,
+  threadPolicyMismatch,
+  threadStartParams,
+  turnStartParams,
+} from "../dist/src/session.js";
 import { selectDefaultModel } from "../dist/src/model-select.js";
 import { SERVER_VERSION } from "../dist/src/status.js";
 import { redactMessage } from "../dist/src/turn-error.js";
@@ -46,6 +57,28 @@ const realCwd = realpathSync(cwd);
 
 const bin = resolveCodexBin();
 const report = { codex_bin_source: bin.source, codex_bin_valid: bin.path !== null, steps: [] };
+
+const SAFE_ENUM = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+const enumOrNull = (v) => (typeof v === "string" && SAFE_ENUM.test(v) ? v : null);
+const boolOrNull = (v) => (typeof v === "boolean" ? v : null);
+
+/** Effective thread policy without paths: enums, booleans and root counts relative to cwd. */
+function policySummary(r, expectedCwd) {
+  const sb = r?.sandbox && typeof r.sandbox === "object" ? r.sandbox : {};
+  const roots = Array.isArray(sb.writableRoots) ? sb.writableRoots : null;
+  return {
+    cwd_matches: r?.cwd === expectedCwd,
+    approval_policy: enumOrNull(r?.approvalPolicy),
+    approvals_reviewer: enumOrNull(r?.approvalsReviewer),
+    sandbox_type: enumOrNull(sb.type),
+    network_access: boolOrNull(sb.networkAccess),
+    exclude_slash_tmp: boolOrNull(sb.excludeSlashTmp),
+    exclude_tmpdir_env_var: boolOrNull(sb.excludeTmpdirEnvVar),
+    writable_roots_count: roots ? roots.length : null,
+    writable_roots_equal_cwd: roots ? roots.filter((x) => x === expectedCwd).length : null,
+    policy_mismatch: threadPolicyMismatch(r, expectedCwd),
+  };
+}
 
 function safe(e) {
   if (e instanceof CodexClientError) return { kind: e.kind, ...(e.rpc ?? {}) };
@@ -106,7 +139,7 @@ function pongTurn(client, threadId) {
       }
     });
     client
-      .request("turn/start", turnStartParams(threadId, PONG_PROMPT), { timeoutMs: 30_000 })
+      .request("turn/start", turnStartParams(threadId, PONG_PROMPT, realCwd), { timeoutMs: 30_000 })
       .then((r) => {
         if (typeof r?.turn?.id !== "string") throw new CodexClientError("protocol");
         turnId = r.turn.id;
@@ -142,8 +175,11 @@ if (bin.path !== null) {
     if (model !== undefined) {
       await step("thread_start", async () => {
         const r = await client.request("thread/start", threadStartParams(realCwd, model), { timeoutMs: 30_000 });
-        if (typeof r?.thread?.id === "string") threadId = r.thread.id;
-        return { thread_id_present: threadId !== undefined };
+        const policy = policySummary(r, realCwd);
+        const present = typeof r?.thread?.id === "string";
+        // Same gate as the server: no turn on a mismatched effective policy.
+        if (present && policy.policy_mismatch === null) threadId = r.thread.id;
+        return { ok: present && policy.policy_mismatch === null, thread_id_present: present, policy };
       });
     }
     if (taskError && threadId !== undefined) {

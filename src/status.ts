@@ -3,7 +3,7 @@ import { realpathSync } from "node:fs";
 import os from "node:os";
 import { CodexClientError, CodexRpcClient, type CodexTransport } from "./codex-client.js";
 import { resolveCodexBin, spawnAppServer } from "./process-transport.js";
-import { APPROVAL_POLICY, initializeParams, SANDBOX_MODE } from "./session.js";
+import { APPROVAL_POLICY, APPROVALS_REVIEWER, initializeParams, SANDBOX_MODE } from "./session.js";
 
 const VERSION_TIMEOUT_MS = 5_000;
 const VERSION_MAX_BYTES = 4096;
@@ -275,7 +275,15 @@ export interface CodexStatus {
   mode: "trusted-local-delegation";
   codex_cli_version: string | null;
   codex_cli_available: boolean;
-  launch: { approval_policy: string; sandbox: string; experimental_api: false };
+  launch: {
+    approval_policy: string;
+    approvals_reviewer: string;
+    sandbox: string;
+    writable_roots: "task_cwd_only";
+    network_access: false;
+    temp_dirs_writable: false;
+    experimental_api: false;
+  };
   plugins: Listing<PluginSummary>;
   mcp_servers: Listing<McpServerSummary>;
   image_generate_enabled: boolean;
@@ -305,14 +313,24 @@ export async function getStatus(
     mode: "trusted-local-delegation",
     codex_cli_version: version,
     codex_cli_available: version !== null,
-    launch: { approval_policy: APPROVAL_POLICY, sandbox: SANDBOX_MODE, experimental_api: false },
+    launch: {
+      approval_policy: APPROVAL_POLICY,
+      approvals_reviewer: APPROVALS_REVIEWER,
+      sandbox: SANDBOX_MODE,
+      writable_roots: "task_cwd_only",
+      network_access: false,
+      temp_dirs_writable: false,
+      experimental_api: false,
+    },
     plugins: caps.plugins,
     mcp_servers: caps.mcp_servers,
     image_generate_enabled: imageEnabled,
     image_edit_enabled: false,
     note:
       "Trusted-local capability, not a security boundary: delegated prompts run as a general Codex agent " +
-      "with the user's normal Codex config, plugins and MCP servers, under native read-only sandbox and " +
-      "on-request approvals. Approval requests are denied and fail the job with APPROVAL_REQUIRED.",
+      "with the user's normal Codex config, plugins, hooks and MCP servers, under the native workspace-write " +
+      "sandbox (writable root = task cwd only, no network, /tmp and $TMPDIR excluded) and on-request approvals. " +
+      "Writes inside cwd need no approval; elevated approval requests are denied and fail the job with " +
+      "APPROVAL_REQUIRED. Plugins, hooks and MCP servers may act outside the sandbox.",
   };
 }

@@ -14,8 +14,10 @@ general delegation server with an optional image helper.)
   designed to be hosted anywhere.
 - **Uses your own sign-ins.** Codex and Claude each use the account you sign in with
   yourself. Nothing is copied between tools or machines, and there is no API-key fallback.
-- **Cautious by default.** Codex runs read-only. If a request needs your approval, the job
-  stops; nothing approves it on your behalf. See
+- **Writes only inside the folder you give it.** Codex may create and change files inside
+  the task's `cwd` folder without asking, with no network access. Anything beyond that
+  (writing elsewhere, network, extra permissions) would need an approval, and the job
+  stops instead; nothing approves it on your behalf. See
   [What it can and cannot do](#what-it-can-and-cannot-do).
 
 ## Before you start
@@ -239,6 +241,35 @@ Type `/mcp` and confirm that `codex-image-mcp` is listed. Then ask Claude:
 `codex_status` should show your Codex version, and the task should succeed with `PONG`.
 This check makes no images and needs no paid plugins.
 
+#### First writable test (create, then modify)
+
+Codex can write inside the `cwd` folder, so use an **empty, throwaway folder** for this test,
+never your home folder or a project you care about. In Terminal:
+
+```sh
+mkdir -p "$HOME/codex-write-test"
+cd "$HOME/codex-write-test"
+pwd -P      # the exact canonical path to use as cwd below (no symlinks, no trailing /)
+```
+
+Then ask Claude, using that exact path. Run one job at a time and wait for it to finish:
+
+> Call `codex_task_start` with `cwd` set to `"/absolute/path/from/pwd"` and the prompt
+> `Create receipt.txt containing exactly the text initial receipt followed by one newline.
+> Do not change anything else.` Then poll `codex_task_status` with exactly the returned
+> `job_id` until it is no longer `running`, and show me the result.
+
+When that has succeeded, start a **second** job with the same `cwd`:
+
+> Call `codex_task_start` with the same `cwd` and the prompt `Replace the contents of
+> receipt.txt with exactly the text final receipt followed by one newline. Do not change
+> anything else.` Then poll `codex_task_status` until it is no longer `running`.
+
+Check the result yourself in Terminal with `cat receipt.txt`. Each job is a new Codex
+thread, so the second one only knows about the file because it is on disk. No approval
+should be asked for. If a job fails with `APPROVAL_REQUIRED` or `POLICY_MISMATCH`, see
+[Troubleshooting](#troubleshooting). Delete the test folder when you are done.
+
 ### Claude Desktop (Local)
 
 Quit Claude Desktop completely and open it again so it reloads MCP servers. Start a
@@ -280,13 +311,16 @@ Before you enable it, be aware of the following:
 
 ## What it can and cannot do
 
-- Every job starts a new Codex thread with a **read-only sandbox** and `on-request`
-  approvals. **Approvals are not passed through to you.** Anything that needs permission
-  (writing files, running commands that need approval, extra permissions, signing in)
-  stops the job with an error such as `APPROVAL_REQUIRED`. This is **not** an
-  unrestricted agent that can write to your files.
-- The task still runs as a **general Codex agent** with your Codex config, plugins and MCP
-  servers. Only send prompts you would type into Codex yourself.
+- Every job starts a new Codex thread with a **workspace-write sandbox** whose **only**
+  writable folder is the `cwd` you pass, with **no network** and with `/tmp` and `$TMPDIR`
+  excluded. Codex can create, modify and delete files inside `cwd` without asking you.
+  Pick `cwd` deliberately; `/`, your home folder and its parent folders are refused.
+- **Approvals are not passed through to you.** Anything that needs permission (writing
+  outside `cwd`, network, running commands that need approval, extra permissions,
+  signing in) stops the job with an error such as `APPROVAL_REQUIRED`.
+- The task still runs as a **general Codex agent** with your Codex config, plugins, hooks
+  and MCP servers. Those are trusted-local and are **not** contained by the sandbox. Only
+  send prompts you would type into Codex yourself.
 - `codex_status` lists the plugins and MCP servers Codex reports. Being listed does not
   mean they have been tested with this bridge. Paid integrations are **unverified**, and
   any costs they incur are your responsibility.
@@ -323,9 +357,13 @@ For the full details, see the
   leave it alone. Replace it only **explicitly and on purpose**: remove that exact entry
   in its own scope, then register again.
 - **`APPROVAL_REQUIRED`.** The task needed a permission that this bridge will not grant on
-  your behalf. If the task is appropriate, run it yourself in your own interactive Codex
-  session. Don't try to get around the restriction with bypass flags or config
-  overrides.
+  your behalf, typically writing outside `cwd`, network access or a command escalation.
+  If the task is appropriate, run it yourself in your own interactive Codex session.
+  Don't try to get around the restriction with bypass flags or config overrides.
+- **`POLICY_MISMATCH`.** Codex reported a thread policy different from the one requested
+  (for example an extra writable folder or network access coming from your Codex
+  config), so the job stopped **before** your prompt was sent to Codex. Check
+  your Codex config for sandbox overrides.
 - **`AUTH_REQUIRED`.** Run `codex login` in Terminal and sign in yourself, then try again.
   Never paste or copy tokens.
 - **`MODEL_UNAVAILABLE`.** Codex did not advertise exactly one default model for your
@@ -358,17 +396,37 @@ The sections below are the technical reference.
 ## Trust model — this is a capability, not a security boundary
 
 - The delegated `prompt` runs as a **general Codex agent** using your normal Codex home,
-  config, login, trust settings, plugins and MCP servers. Anything they can do under the
-  native policy, a prompt can ask for. Only send prompts you would type into Codex yourself.
-- Every thread is **new** (no resume/fork of existing sessions) and is started with
-  `approvalPolicy: "on-request"` and `sandbox: "read-only"`. No bypass / dangerous flags
-  and no `--config` overrides are used; this server never reads `auth.json`/`config.toml`
-  and never logs in, extracts tokens, or falls back to an API key.
+  config, login, trust settings, plugins, hooks and MCP servers. Anything they can do under
+  the native policy, a prompt can ask for. Plugins, hooks and MCP servers are trusted-local:
+  the sandbox is **not** a containment boundary for them. Only send prompts you would type
+  into Codex yourself.
+- Every job uses a **new** app-server process and a **new** thread (no resume/fork of
+  existing sessions), with the model `model/list` advertises as default (see
+  [model selection](#tools)). `thread/start` sends `cwd`, `approvalPolicy: "on-request"`,
+  `approvalsReviewer: "user"` and `sandbox: "workspace-write"`. `turn/start` then sends an
+  explicit `sandboxPolicy` of
+  `{type: "workspaceWrite", writableRoots: [cwd], networkAccess: false, excludeSlashTmp: true, excludeTmpdirEnvVar: true}`,
+  so `cwd` is the only writable root, there is no network, and `/tmp` / `$TMPDIR` are
+  not writable roots for the turn.
+- **Policy check before the turn.** The effective policy that `thread/start` reports is
+  verified first: `cwd`, `on-request`, reviewer `user`, `workspaceWrite`, network not
+  enabled, and `writableRoots` either empty (cwd is the implicit root) or exactly `[cwd]`.
+  Anything else, e.g. an extra root or network from your config, fails the job with
+  `POLICY_MISMATCH` before `turn/start`. The thread-level `/tmp`/`$TMPDIR` flags cannot be
+  set through `thread/start`; they are tolerated there and overridden by the explicit turn
+  policy. (Observed with codex-cli 0.156.0: the thread reports `writableRoots: []`,
+  `networkAccess: false` and both temp exclusions `false` before the turn override; see
+  [`docs/workspace-write-verification.md`](docs/workspace-write-verification.md).)
+- No bypass / dangerous flags and no `--config` overrides are used; this server never
+  reads `auth.json`/`config.toml` and never logs in, extracts tokens, or falls back to an
+  API key.
 - **Native approvals are not bridged to an interactive UI.** Any approval request (command,
   file change, permissions), MCP elicitation, user-input request, dynamic tool call or auth
   refresh is **denied** with a JSON-RPC error (no fabricated answer), the turn is interrupted,
   the process terminated, and the job fails with a typed error such as `APPROVAL_REQUIRED`
-  plus a coarse `request_kind` (never the raw request).
+  plus a coarse `request_kind` (never the raw request). Writes inside `cwd` need no approval;
+  an attempted write outside it, network use or an escalation surfaces as such a request
+  and is denied (headless: there is nobody to approve it).
 - Plugins/MCP servers configured in Codex remain usable inside the native sandbox/approval
   policy; paid plugins may spend money — that is your responsibility.
 - Task result text is Codex output and may contain sensitive material from your workspace.
@@ -378,7 +436,7 @@ The sections below are the technical reference.
 | tool | input | notes |
 |---|---|---|
 | `codex_status` | `{}` | CLI version, launch policy, installed plugin names (`plugin/installed`) and MCP server names (`mcpServerStatus/list` with `detail: "toolsAndAuthOnly"`, `limit: 50`, at most 4 pages / 100 names). Each listing has `truncated` (a local bound dropped entries) and `has_more` (peer still had a next page; `null` if unknown). A failed method gives `available:false` + a reason made only of fixed enums (e.g. `mcpServerStatus/list failed: rpc invalid_request/experimental_api_required`). No URLs/paths/accounts/tool schemas. |
-| `codex_task_start` | `{prompt, cwd}` | `cwd`: absolute, normalized, existing directory, no symlinks, not `/` or `$HOME`. Returns `job_id`. Single active job; `BUSY` otherwise. |
+| `codex_task_start` | `{prompt, cwd}` | `cwd`: absolute, normalized, existing directory, no symlinks, not `/`, `$HOME` or an ancestor of `$HOME`. It becomes the only writable root of the turn. Returns `job_id`. Single active job; `BUSY` otherwise. |
 | `codex_task_status` | `{job_id}` | `running` / `succeeded` / `failed` / `cancelled`, result or typed error. |
 | `codex_task_cancel` | `{job_id}` | Interrupts the turn and kills the process. |
 | `codex_image_generate` | `{prompt, cwd}` | Listed only if `CODEX_IMAGE_OUTPUT_ROOT` is set. Success **only** if a native `imageGeneration` item reports a `savedPath` under the Codex home that verifies as a regular PNG/JPEG (signature, size, no symlinks, single link); bytes are copied to `<root>/<uuid>/<uuid>.png`. Succeeded result: `{job_id, files: [{path, mime_type, bytes, sha256}], codex_version}`. A text-only completion is `NO_IMAGE_PRODUCED`. No image editing tool. |
@@ -392,7 +450,7 @@ The bridge **never retries** requests, turns or generations (Codex's own interna
 still retry transport). Error codes: `APPROVAL_REQUIRED`, `UNSUPPORTED_SERVER_REQUEST`,
 `AUTH_REQUIRED`, `QUOTA_EXCEEDED`, `TIMEOUT`, `CANCELLED`, `TURN_FAILED`,
 `TURN_INTERRUPTED`, `PROTOCOL_ERROR`, `PROCESS_EXITED`, `OUTPUT_LIMIT`, `SPAWN_FAILED`,
-`NO_IMAGE_PRODUCED`, `IMAGE_VERIFICATION_FAILED`, `MODEL_UNAVAILABLE`.
+`NO_IMAGE_PRODUCED`, `IMAGE_VERIFICATION_FAILED`, `MODEL_UNAVAILABLE`, `POLICY_MISMATCH`.
 
 Model selection: each job calls the read-only `model/list` on its own app-server and
 passes the single entry advertised with `isDefault: true` as `model` to the NEW
@@ -405,7 +463,9 @@ invalid list shape fails with `MODEL_UNAVAILABLE` (`diagnostic.model_selection`)
 before any thread or turn is started.
 
 Path-check caveat: the file checks narrow but cannot eliminate TOCTOU races with other
-processes running as your user; `cwd` is validated only at start.
+processes running as your user; `cwd` is validated only at start. If the directory (or a
+parent) is replaced, e.g. by a symlink, after validation, the writable root Codex applies
+is whatever that path then resolves to.
 
 ## Prerequisites
 
@@ -444,7 +504,12 @@ Follow [Before you start](#before-you-start) and [Install](#install) on that Mac
 
 - Fixture tests, lint, typecheck and build pass. Live runs (see
   [`docs/runtime-verification.md`](docs/runtime-verification.md)): `codex_status` and a
-  read-only `PONG` task succeeded. The single authorized image smoke generated exactly one
+  `PONG` task succeeded under the earlier read-only policy. The current workspace-write
+  policy was verified live through Claude Code (MCP tools only, no approvals): one job
+  created a file inside `cwd` and a second, separate job modified it, with byte-exact
+  read-back and an unchanged sentinel outside `cwd`
+  ([`docs/workspace-write-verification.md`](docs/workspace-write-verification.md)).
+  The single authorized image smoke (earlier read-only policy) generated exactly one
   native image but the MCP job **failed with `OUTPUT_LIMIT`**; the frame bound was then
   raised to 8 MiB and the image was recovered read-only via `thread/read` (hash-verified).
   The repaired image path has **not** been re-run live, so end-to-end image success is
@@ -470,11 +535,16 @@ npm run build
 ```sh
 npm run build
 node scripts/smoke.mjs status
-node scripts/smoke.mjs task                               # read-only "PONG" task
+node scripts/smoke.mjs task                               # "PONG" task, no file edits requested
+node scripts/smoke.mjs write                              # create, then modify, one file in the workspace
 node scripts/smoke.mjs image --confirm-spend-one-image    # ONE real generation, no retry
 ```
 
 Each run uses a git-ignored `.smoke/<uuid>/` workspace and writes `evidence.json` there.
+`write` checks exact UTF-8/LF bytes after each job, keeps the observed bytes as
+`receipt-<step>.txt` and checks a sentinel outside the workspace. It drives the server
+through the MCP SDK client; it is a supplement to, not a replacement for, the test
+through Claude Code itself described above.
 
 ## License
 
