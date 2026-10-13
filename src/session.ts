@@ -1,18 +1,24 @@
 // One delegated Codex turn on a NEW thread in a fresh app-server process.
 //
-// Lifecycle: initialize -> initialized -> model/list -> thread/start -> turn/start -> wait for
-// the matching turn/completed. Native approval/sandbox stay in force: the
-// thread is started with approvalPolicy "on-request" and sandbox "read-only".
-// Every server-initiated request (approval, elicitation, auth refresh, dynamic
-// tool, user input) is denied and fails the job with a typed error; this
-// bridge never answers one on the user's behalf. No retries anywhere.
+// Lifecycle: initialize -> initialized -> model/list -> thread/start -> verify
+// the effective thread policy -> turn/start -> wait for the matching
+// turn/completed. Native approval/sandbox stay in force: the thread is started
+// with sandbox "workspace-write", approvalPolicy "on-request" and approvals
+// routed to "user"; the turn sends an explicit workspaceWrite sandboxPolicy
+// whose only writable root is the validated cwd (no network, /tmp and $TMPDIR
+// excluded). Writes inside cwd need no approval. Every server-initiated
+// request (elevated approval, elicitation, auth refresh, dynamic tool, user
+// input) is denied and fails the job with a typed error; this bridge never
+// answers one on the user's behalf. No retries anywhere.
 
 import { CodexClientError, CodexRpcClient, type CodexTransport, type RpcErrorInfo } from "./codex-client.js";
+import { assertCwdShape } from "./cwd.js";
 import { selectDefaultModel, type ModelSelectionFailure } from "./model-select.js";
 import { classifyTurnMessage, httpStatusFromMessage, type TurnMessageClass } from "./turn-error.js";
 
 export const APPROVAL_POLICY = "on-request" as const;
-export const SANDBOX_MODE = "read-only" as const;
+export const APPROVALS_REVIEWER = "user" as const;
+export const SANDBOX_MODE = "workspace-write" as const;
 export const MAX_RESULT_TEXT_BYTES = 64 * 1024;
 const MAX_IMAGE_ITEMS = 8;
 const RPC_TIMEOUT_MS = 30_000;
@@ -29,17 +35,82 @@ export function initializeParams(clientVersion: string): Record<string, unknown>
 }
 
 /**
- * ThreadStartParams: new thread, native on-request approvals, read-only sandbox,
- * and the model id this app-server's own `model/list` advertises as default
- * (src/model-select.ts). Nothing else.
+ * ThreadStartParams: new thread, native on-request approvals reviewed by the
+ * user (never auto_review), workspace-write sandbox, and the model id this
+ * app-server's own `model/list` advertises as default (src/model-select.ts).
+ * Nothing else: no `config`, no writable-root or network overrides.
  */
 export function threadStartParams(cwd: string, model: string): Record<string, unknown> {
-  return { cwd, model, approvalPolicy: APPROVAL_POLICY, sandbox: SANDBOX_MODE };
+  return { cwd: assertCwdShape(cwd), model, approvalPolicy: APPROVAL_POLICY, approvalsReviewer: APPROVALS_REVIEWER, sandbox: SANDBOX_MODE };
 }
 
-/** TurnStartParams: one UserInput text item; `text_elements` (snake_case, serde-default) sent as []. */
-export function turnStartParams(threadId: string, prompt: string): Record<string, unknown> {
-  return { threadId, input: [{ type: "text", text: prompt, text_elements: [] }] };
+/**
+ * SandboxPolicy (WorkspaceWriteSandboxPolicy) for the turn: cwd is the only
+ * writable root, no network, and the schema-defaulted /tmp and $TMPDIR roots
+ * are explicitly excluded.
+ */
+export function workspaceWritePolicy(cwd: string): Record<string, unknown> {
+  return { type: "workspaceWrite", writableRoots: [assertCwdShape(cwd)], networkAccess: false, excludeSlashTmp: true, excludeTmpdirEnvVar: true };
+}
+
+/**
+ * TurnStartParams: one UserInput text item (`text_elements`, snake_case,
+ * serde-default, sent as []), plus explicit cwd, approval policy, reviewer and
+ * sandbox policy so nothing is inherited from config for this turn.
+ */
+export function turnStartParams(threadId: string, prompt: string, cwd: string): Record<string, unknown> {
+  return {
+    threadId,
+    input: [{ type: "text", text: prompt, text_elements: [] }],
+    cwd: assertCwdShape(cwd),
+    approvalPolicy: APPROVAL_POLICY,
+    approvalsReviewer: APPROVALS_REVIEWER,
+    sandboxPolicy: workspaceWritePolicy(cwd),
+  };
+}
+
+/** Which part of the effective ThreadStartResponse policy did not match. Fixed enums only. */
+export type PolicyMismatch =
+  | "invalid_shape"
+  | "cwd"
+  | "approval_policy"
+  | "approvals_reviewer"
+  | "sandbox_type"
+  | "network_access"
+  | "writable_roots";
+
+/**
+ * Verifies the effective policy a ThreadStartResponse reports (codex-cli
+ * 0.156.0: required `cwd`, `approvalPolicy`, `approvalsReviewer`, `sandbox`)
+ * before any turn is started. Returns null when acceptable.
+ *
+ * Accepted semantics: `sandbox` must be workspaceWrite with networkAccess
+ * false (schema default when absent) and writableRoots empty (cwd is the
+ * implicit root) or exactly [cwd]; any other root is an ambient broadening
+ * from config and is rejected. excludeSlashTmp / excludeTmpdirEnvVar are not
+ * settable through thread/start (SandboxMode only), so their thread-level
+ * values are tolerated and overridden by the explicit turn sandboxPolicy.
+ */
+export function threadPolicyMismatch(resp: unknown, cwd: string): PolicyMismatch | null {
+  const r = obj(resp);
+  const sb = obj(r?.sandbox);
+  if (!r || !sb || typeof sb.type !== "string") return "invalid_shape";
+  if (r.cwd !== cwd) return "cwd";
+  const thread = obj(r.thread);
+  if (thread && "cwd" in thread && thread.cwd !== cwd) return "cwd";
+  if (r.approvalPolicy !== APPROVAL_POLICY) return "approval_policy";
+  if (r.approvalsReviewer !== APPROVALS_REVIEWER) return "approvals_reviewer";
+  if (sb.type !== "workspaceWrite") return "sandbox_type";
+  if (sb.networkAccess !== undefined && sb.networkAccess !== false) return "network_access";
+  for (const k of ["excludeSlashTmp", "excludeTmpdirEnvVar"]) {
+    if (sb[k] !== undefined && typeof sb[k] !== "boolean") return "invalid_shape";
+  }
+  const roots = sb.writableRoots;
+  if (roots !== undefined) {
+    if (!Array.isArray(roots)) return "invalid_shape";
+    if (roots.length > 1 || roots.some((x) => x !== cwd)) return "writable_roots";
+  }
+  return null;
 }
 
 export type Phase = "spawn" | "initialize" | "model_select" | "thread_start" | "turn_start" | "turn";
@@ -75,6 +146,8 @@ export interface TaskDiagnostic {
   field?: string;
   /** Why the advertised default model could not be selected (src/model-select.ts). */
   model_selection?: ModelSelectionFailure;
+  /** Which effective thread policy field mismatched (threadPolicyMismatch). */
+  policy_mismatch?: PolicyMismatch;
   codex_error_info?: string;
   /** Which whitelisted pattern TurnError.message matched (src/turn-error.ts); not a guessed cause. */
   turn_message_class?: TurnMessageClass;
@@ -124,6 +197,7 @@ export type TaskErrorCode =
   | "CANCELLED"
   | "INITIALIZE_FAILED"
   | "MODEL_UNAVAILABLE"
+  | "POLICY_MISMATCH"
   | "THREAD_START_FAILED"
   | "TURN_START_FAILED"
   | "TURN_FAILED"
@@ -264,6 +338,12 @@ export function fromClientError(e: unknown, phase: Phase): TaskError {
 
 export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
   if (opts.signal.aborted) throw new TaskError("CANCELLED", undefined, { phase: "spawn" });
+  try {
+    assertCwdShape(opts.cwd);
+  } catch {
+    // Callers pass validateCwd() output; anything else never reaches Codex.
+    throw new TaskError("POLICY_MISMATCH", undefined, { phase: "spawn", policy_mismatch: "cwd" });
+  }
   let transport: CodexTransport;
   try {
     transport = opts.createTransport(opts.cwd);
@@ -366,12 +446,15 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     const ts = obj(await rpc("thread/start", threadStartParams(opts.cwd, sel.model)));
     const thread = obj(ts?.thread);
     if (!thread || typeof thread.id !== "string") throw new TaskError("PROTOCOL_ERROR");
+    // Fail closed before any turn: the effective policy must be the bounded one.
+    const mismatch = threadPolicyMismatch(ts, opts.cwd);
+    if (mismatch !== null) throw new TaskError("POLICY_MISMATCH", undefined, { phase, policy_mismatch: mismatch });
     threadId = thread.id;
     phase = "turn_start";
     const turnDone = new Promise<TurnDone>((resolve) => {
       turnDoneResolve = resolve;
     });
-    const tr = obj(await rpc("turn/start", turnStartParams(threadId, opts.prompt)));
+    const tr = obj(await rpc("turn/start", turnStartParams(threadId, opts.prompt, opts.cwd)));
     const turn = obj(tr?.turn);
     if (!turn || typeof turn.id !== "string") throw new TaskError("PROTOCOL_ERROR");
     turnId = turn.id;

@@ -18,8 +18,50 @@ export function fakeModel(id: string, isDefault: boolean): object {
   return { id, model: id, displayName: id, description: "", hidden: false, isDefault, defaultReasoningEffort: "medium", supportedReasoningEfforts: [] };
 }
 
+/**
+ * A ThreadStartResponse shaped per the codex-cli 0.156.0 v2 schema (all
+ * required fields). Not captured from a live run: the effective sandbox here
+ * is the assumed result of `sandbox: "workspace-write"` with no config
+ * overrides (cwd implicit, so writableRoots [], schema-default tmp flags).
+ * `overrides` replaces top-level fields; `sandbox` overrides replace sandbox fields.
+ */
+export function threadStartResult(
+  cwd: unknown,
+  overrides: Record<string, unknown> = {},
+  sandbox: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    thread: {
+      id: THREAD_ID,
+      cwd,
+      cliVersion: "0.156.0",
+      createdAt: 0,
+      updatedAt: 0,
+      ephemeral: false,
+      modelProvider: "openai",
+      preview: "",
+      projectId: null,
+      sessionId: "sess_1",
+      source: "appServer",
+      status: { type: "idle" },
+      turns: [],
+    },
+    model: DEFAULT_MODEL,
+    modelProvider: "openai",
+    cwd,
+    approvalPolicy: "on-request",
+    approvalsReviewer: "user",
+    sandbox: { type: "workspaceWrite", writableRoots: [], networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false, ...sandbox },
+    reasoningEffort: null,
+    serviceTier: null,
+    ...overrides,
+  };
+}
+
 export class FakeAppServer implements CodexTransport {
   readonly received: Msg[] = [];
+  /** Exact framed lines written by the client (without "\n"), for byte-exact assertions. */
+  readonly lines: string[] = [];
   killed = false;
   closed = false;
   private out: ((c: string) => void)[] = [];
@@ -29,6 +71,7 @@ export class FakeAppServer implements CodexTransport {
   write(data: string): void {
     for (const line of data.split("\n").filter(Boolean)) {
       const msg = JSON.parse(line) as Msg;
+      this.lines.push(line);
       this.received.push(msg);
       if (msg.method && msg.id !== undefined) {
         const reply = this.script.onRequest ? this.script.onRequest(msg, this) : defaultReply(msg);
@@ -71,7 +114,7 @@ export function defaultReply(msg: Msg): unknown {
     case "model/list":
       return { result: { data: [fakeModel("other-model", false), fakeModel(DEFAULT_MODEL, true)], nextCursor: null } };
     case "thread/start":
-      return { result: { thread: { id: THREAD_ID } } };
+      return { result: threadStartResult(msg.params?.cwd) };
     case "turn/start":
       return { result: { turn: { id: TURN_ID, items: [], status: "inProgress" } } };
     case "turn/interrupt":

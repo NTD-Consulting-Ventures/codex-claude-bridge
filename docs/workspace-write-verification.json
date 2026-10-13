@@ -1,0 +1,187 @@
+{
+  "note": "Sanitized live-run record for the workspace-write policy. Runs were parent-controlled; file bytes were read back independently by the parent. Raw evidence (stream-json, stderr, prompts) stays in git-ignored .harness-evidence/ and .smoke/ and is not embedded: no session ids, raw prompts or results, account, config or credential data.",
+  "commit": "not recorded here; the final candidate commit and tree are supplied in the Kanban handoff",
+  "environment": {
+    "codex_cli": "codex-cli 0.156.0 (official, installed, logged in normally)",
+    "claude_cli": "2.1.293",
+    "claude_model_requested": "opus",
+    "claude_model_resolved": "claude-opus-5-5",
+    "schema": {
+      "command": "codex app-server generate-json-schema --out .harness-evidence/schema",
+      "note": "non-experimental codex-cli 0.156.0 app-server schema (git-ignored output)",
+      "sha256": {
+        "ThreadStartParams.json": "e9c6d3cc18d049bfbc0249add3808fb8e5a27e1a0b5a423767aafbc3859a9428",
+        "ThreadStartResponse.json": "daaeb4c716e78d93e53c646224e4bfe11ca13bd6aa23ae6ee60103a12da30745",
+        "TurnStartParams.json": "2dfcf68705896fadc344ccfeb2e9fe5a6bcbbb8b9a90cf449ce232b636daf05a"
+      }
+    }
+  },
+  "policy": {
+    "thread_start": {
+      "cwd": "<validated canonical cwd>",
+      "approvalPolicy": "on-request",
+      "approvalsReviewer": "user",
+      "sandbox": "workspace-write",
+      "model": "single isDefault entry from model/list (per job)"
+    },
+    "turn_start_sandboxPolicy": {
+      "type": "workspaceWrite",
+      "writableRoots": ["<cwd>"],
+      "networkAccess": false,
+      "excludeSlashTmp": true,
+      "excludeTmpdirEnvVar": true
+    },
+    "thread_policy_check": "verified before turn/start: cwd, on-request, reviewer user, workspaceWrite, network not enabled, writableRoots empty (implicit cwd root) or exactly [cwd]; otherwise POLICY_MISMATCH and no turn",
+    "approvals": "not bridged; any server request (approval, elicitation, auth refresh, dynamic tool, user input) is denied, job fails (APPROVAL_REQUIRED / UNSUPPORTED_SERVER_REQUEST)"
+  },
+  "policy_diagnostic": {
+    "evidence": ".harness-evidence/policy-diagnostic.json",
+    "command": "node scripts/diagnose.mjs (thread/start only; no turn)",
+    "model_select": "ok",
+    "thread_start_effective_policy": {
+      "cwd_matches": true,
+      "approval_policy": "on-request",
+      "approvals_reviewer": "user",
+      "sandbox_type": "workspaceWrite",
+      "network_access": false,
+      "exclude_slash_tmp": false,
+      "exclude_tmpdir_env_var": false,
+      "writable_roots_count": 0,
+      "policy_mismatch": null
+    },
+    "interpretation": "Thread-level default before the explicit turn override: writableRoots [] (cwd is the implicit root, accepted), network false, temp exclusions false (not settable via thread/start; tolerated). The turn's explicit sandboxPolicy excludes /tmp and $TMPDIR. The diagnostic observes the thread level only; the turn-level effect of the exclusions was not independently probed."
+  },
+  "checks": {
+    "note": "final parent run; fixtures never spawn Codex or claude; includes the cwd shape fixture",
+    "npm_test": { "result": "pass", "passed": 177, "failed": 0, "log": ".harness-evidence/tests-final.log" },
+    "npm_run_lint": { "exit_code": 0, "log": ".harness-evidence/lint-final.log" },
+    "npm_run_typecheck": { "exit_code": 0, "log": ".harness-evidence/typecheck-final.log" },
+    "npm_run_build": { "exit_code": 0, "log": ".harness-evidence/build-final.log" },
+    "git_diff_check": { "exit_code": 0 }
+  },
+  "harness": {
+    "executable": "claude -p \"<prompt file>\" (Claude Code 2.1.293)",
+    "common_flags": [
+      "--model", "opus",
+      "--no-session-persistence",
+      "--strict-mcp-config",
+      "--setting-sources", "",
+      "--permission-mode", "dontAsk",
+      "--permission-prompts", "none",
+      "--disable-slash-commands",
+      "--output-format", "stream-json",
+      "--verbose",
+      "--max-turns", "60"
+    ],
+    "implementation_flags": [
+      "--safe-mode",
+      "--restricted",
+      "--tools", "Read,Write,Edit,Glob,Grep",
+      "--allowedTools", "Read,Write,Edit,Glob,Grep"
+    ],
+    "mcp_only_flags": [
+      "--tools", "",
+      "--mcp-config", ".harness-evidence/smoke-mcp.json",
+      "--allowedTools", "mcp__<server>__codex_task_start,mcp__<server>__codex_task_status,mcp__<server>__codex_status"
+    ],
+    "fallback": "none",
+    "automatic_retry": "none"
+  },
+  "implementation_runs": [
+    {
+      "phase": "implement",
+      "tools": ["Edit", "Glob", "Grep", "Read", "Write"],
+      "wall_limit_seconds": 570,
+      "outcome": "interrupted at 420 s; no result (no turn count, duration or denial count reported); edits kept",
+      "num_turns": null,
+      "reported_duration_ms": null,
+      "permission_denials": null
+    },
+    {
+      "phase": "finish",
+      "tools": ["Edit", "Glob", "Grep", "Read", "Write"],
+      "wall_limit_seconds": 360,
+      "outcome": "success",
+      "exit_code": 0,
+      "wall_seconds": 199.773,
+      "reported_duration_ms": 198945,
+      "num_turns": 60,
+      "permission_denials": 0
+    }
+  ],
+  "live_runs_claude_mcp_only": {
+    "direct_file_tools": "none (--tools '')",
+    "workspace_cwd": ".smoke/workspace-write/workspace",
+    "runs": [
+      {
+        "phase": "smoke-create",
+        "evidence": ".harness-evidence/smoke-create-summary.json",
+        "mcp_server_name": "workspace",
+        "tools_available": [],
+        "result": "setup failure, not a test of the server: the MCP config used the reserved server name 'workspace'; the session started with zero tools and zero MCP servers, so no task was started. Superseded by smoke-create2 (a separate parent-initiated run, not an automatic retry).",
+        "num_turns": 1,
+        "permission_denials": 0,
+        "wall_seconds": 6.335,
+        "exit_code": 0
+      },
+      {
+        "phase": "smoke-create2",
+        "evidence": ".harness-evidence/smoke-create2-summary.json",
+        "mcp_server_name": "writecheck",
+        "tools_available": ["codex_status", "codex_task_cancel", "codex_task_start", "codex_task_status"],
+        "codex_tasks_started": 1,
+        "job_final_state": "succeeded",
+        "result_subtype": "success",
+        "num_turns": 9,
+        "permission_denials": 0,
+        "wall_seconds": 21.856,
+        "exit_code": 0
+      },
+      {
+        "phase": "smoke-modify",
+        "evidence": ".harness-evidence/smoke-modify-summary.json",
+        "mcp_server_name": "writecheck",
+        "tools_available": ["codex_status", "codex_task_cancel", "codex_task_start", "codex_task_status"],
+        "codex_tasks_started": 1,
+        "job_final_state": "succeeded",
+        "result_subtype": "success",
+        "num_turns": 10,
+        "permission_denials": 0,
+        "wall_seconds": 24.514,
+        "exit_code": 0
+      }
+    ]
+  },
+  "readback": {
+    "evidence": ".smoke/workspace-write/readback.json",
+    "file": ".smoke/workspace-write/workspace/receipt.txt",
+    "initial": {
+      "snapshot": ".smoke/workspace-write/receipt-initial.txt",
+      "utf8_text": "workspace-write initial receipt\n",
+      "bytes": 32,
+      "sha256": "bb4d6e872f9dfa75bf2673bf7c95c94146ff1926882757a40ed90a4d8089e911"
+    },
+    "final": {
+      "snapshot": ".smoke/workspace-write/receipt-final.txt",
+      "utf8_text": "workspace-write final receipt\n",
+      "bytes": 30,
+      "sha256": "8d989a0aa466a6f64d161f2934d98ec6d462b7decf4afe3d39f613ac72862995"
+    },
+    "diff": ".smoke/workspace-write/receipt.diff",
+    "diff_text": "--- receipt-initial.txt\n+++ receipt-final.txt\n@@ -1 +1 @@\n-workspace-write initial receipt\n+workspace-write final receipt\n",
+    "outside_sentinel": {
+      "path": ".smoke/workspace-write/outside-sentinel.txt",
+      "sha256_before": "d8513fc069df2d05af11a33732a1f5dd349645fd0af3e0a765e81e062625aabc",
+      "sha256_after": "d8513fc069df2d05af11a33732a1f5dd349645fd0af3e0a765e81e062625aabc",
+      "unchanged": true
+    }
+  },
+  "not_verified": [
+    "scripts/smoke.mjs write (MCP SDK client) was not run; the Claude MCP-only runs above are the live evidence",
+    "a live outside-cwd write or network attempt resulting in APPROVAL_REQUIRED (covered by fixtures only)",
+    "a live POLICY_MISMATCH (covered by fixtures only)",
+    "a live check that the temp exclusions take effect at turn level",
+    "Claude Desktop Local discovery",
+    "image generation under the workspace-write policy"
+  ]
+}

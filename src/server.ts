@@ -25,7 +25,12 @@ const promptCwd = {
   type: "object" as const,
   properties: {
     prompt: { type: "string", minLength: 1, maxLength: MAX_PROMPT_CHARS },
-    cwd: { type: "string", minLength: 1, maxLength: 4096, description: "Absolute existing directory, no symlinks." },
+    cwd: {
+      type: "string",
+      minLength: 1,
+      maxLength: 4096,
+      description: "Absolute canonical existing directory (no symlinks, not / or home or its ancestors). The only writable root.",
+    },
   },
   required: ["prompt", "cwd"],
   additionalProperties: false,
@@ -48,8 +53,10 @@ export const TOOLS = {
     name: "codex_task_start",
     description:
       "Start a delegated Codex task on a NEW thread in the given cwd (trusted-local; not a security boundary). " +
-      "Runs with native sandbox read-only and approvals on-request; any approval request fails the job with " +
-      "APPROVAL_REQUIRED. One active job at a time. Returns a job_id; poll codex_task_status.",
+      "Runs with native sandbox workspace-write bounded to cwd (only writable root; no network; /tmp and $TMPDIR " +
+      "excluded) and approvals on-request: Codex may create and modify files inside cwd without approval. Any " +
+      "elevated approval request (outside-root write, network, escalation) fails the job with APPROVAL_REQUIRED. " +
+      "One active job at a time. Returns a job_id; poll codex_task_status.",
     inputSchema: promptCwd,
     // Conservative: delegated Codex runs with the user's normal config/plugins/MCP servers.
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -71,7 +78,8 @@ export const TOOLS = {
     description:
       "Start a job asking Codex to generate one image natively. Success only if a native imageGeneration item " +
       "yields a verified PNG/JPEG, copied into a UUID subdirectory of CODEX_IMAGE_OUTPUT_ROOT. Succeeded result: " +
-      "{job_id, files:[{path, mime_type, bytes, sha256}], codex_version}. May consume quota; never retried.",
+      "{job_id, files:[{path, mime_type, bytes, sha256}], codex_version}. Same cwd-bounded workspace-write policy " +
+      "as codex_task_start. May consume quota; never retried.",
     inputSchema: promptCwd,
     // Conservative: writes files and the image prompt constraint is not enforced natively.
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
