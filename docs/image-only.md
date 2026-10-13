@@ -1,7 +1,9 @@
 # Image-only mode (opt-in)
 
 By default the bridge lists five tools. With `CODEX_BRIDGE_MODE=image-only` in the
-server's registered environment it lists only these four, unchanged:
+environment the server is started with (preferably stored in its registration; see
+[Where the mode comes from](#where-the-mode-comes-from)) it lists only these four,
+unchanged:
 
 - `codex_status`
 - `codex_image_generate`
@@ -48,8 +50,24 @@ whitespace-only one or different capitalization, stops the server before it acce
 request: it writes a fixed message naming `CODEX_BRIDGE_MODE` to stderr (never the value
 itself) and exits with status 2, so the server is not available in Claude.
 
-Exporting `CODEX_BRIDGE_MODE` in your Terminal has no effect on an existing
-registration; only the registration's stored environment counts.
+## Where the mode comes from
+
+The server is started by Claude Code and inherits the environment Claude Code itself was
+launched with; the registration's stored `env` is applied on top. Observed with the
+official Claude Code CLI 2.1.293:
+
+- **Stored in the registration** (`CODEX_BRIDGE_MODE=general` or `image-only` in the
+  entry's `env`): that value is used, whatever the surrounding environment says.
+- **Not stored:** the server gets whatever `CODEX_BRIDGE_MODE` Claude Code inherited. If
+  you `export CODEX_BRIDGE_MODE=...` in a Terminal and start `claude` from that shell, the
+  server runs in that mode (and an invalid value stops it).
+- **Neither:** `general`.
+
+Exporting the variable never rewrites the stored registration; `claude mcp get` shows
+only what is stored. If you rely on the default, make sure no `CODEX_BRIDGE_MODE` is set
+in the environment you start Claude Code from (`unset CODEX_BRIDGE_MODE`, and check your
+shell profile). For a persistent opt-in, store the mode in the registration deliberately
+rather than depending on the launch environment.
 
 ## Fresh setup
 
@@ -66,7 +84,9 @@ stops it with exit 1 before it finds or runs `claude`. It adds
 `-e CODEX_BRIDGE_MODE=image-only` next to the usual `CODEX_BIN` and
 `CODEX_IMAGE_OUTPUT_ROOT`, and `claude mcp get` must read all three back exactly.
 Without `CODEX_BRIDGE_MODE` the script registers exactly what 0.2.1 did (no mode stored,
-so the server runs in general mode). `--check-auth` validates the mode the same way (an
+so the server runs in general mode unless Claude Code is launched with
+`CODEX_BRIDGE_MODE` in its environment; see
+[Where the mode comes from](#where-the-mode-comes-from)). `--check-auth` validates the mode the same way (an
 invalid value exits 1 before any CLI is found or run); a valid mode does not affect the
 sign-in check, and `--check-auth` never changes MCP config.
 
@@ -144,4 +164,7 @@ the args are uncertain at any step before the removal, stop there: nothing has c
    by hand from the record you saved in step 2.
 
 To go back to general mode, follow the same steps with `CODEX_BRIDGE_MODE` left out of
-the replacement (or set to `general`). Then start a new Claude Code session.
+the replacement (or set to `general`). Leaving it out means the server uses whatever
+`CODEX_BRIDGE_MODE` Claude Code inherits, so also clear any exported value from the
+environment you start Claude Code from; storing `general` explicitly overrides it. Then
+start a new Claude Code session.
