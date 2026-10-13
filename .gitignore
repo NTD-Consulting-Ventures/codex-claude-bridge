@@ -1,0 +1,25 @@
+# Research material (downloaded upstream source, generated schema, notes)
+research/
+.protocol-research/
+.app-server-reference.md
+
+# Harness logs and evidence
+.harness-evidence/
+*.log
+
+# Generated outputs
+outputs/
+output/
+generated_images/
+*.png
+*.jpg
+*.jpeg
+*.webp
+
+# Auth / secrets
+auth.json
+.codex/
+.env
+.env.*
+*.pem
+*.key
