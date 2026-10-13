@@ -9,15 +9,22 @@
 // this process only; it is never added to Codex's writable roots.
 // Inputs are strictly validated; the only free-form value forwarded to Codex
 // is the delegated prompt. No model/config/URL/shell parameters exist.
+//
+// CODEX_BRIDGE_MODE (src/bridge-mode.ts) is resolved once per ToolHandler.
+// "image-only" lists only codex_status, codex_image_generate, codex_task_status
+// and codex_task_cancel; codex_task_start is refused with TOOL_DISABLED before
+// any validation, and jobs of kind "task" are reported as UNKNOWN_JOB. This
+// narrows the MCP tool surface only; the Codex launch policy is unchanged.
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { pathToFileURL } from "node:url";
+import { requireBridgeMode, resolveBridgeMode, type BridgeMode } from "./bridge-mode.js";
 import type { CodexTransport } from "./codex-client.js";
 import { CwdError, validateCwd } from "./cwd.js";
 import { buildImagePrompt, codexHome, collectImage, ImageError, type CollectHooks, type ImageFile, type ImageResult } from "./image-service.js";
-import { DEFAULT_WALL_MS, JobManager, MAX_WALL_MS, throwIfAborted } from "./jobs.js";
+import { DEFAULT_WALL_MS, JobManager, MAX_WALL_MS, throwIfAborted, type JobView } from "./jobs.js";
 import { resolveOutputRoot, type OutputRootResolution } from "./output-root.js";
 import { resolveCodexBin, spawnAppServer, terminateAllAppServers } from "./process-transport.js";
 import { runDelegatedTurn, TaskError, type TurnOutcome } from "./session.js";
@@ -95,6 +102,18 @@ export const TOOLS = {
   },
 };
 
+type ToolName = keyof typeof TOOLS;
+
+/** Tools listed (and callable) per bridge mode, in listing order. */
+export const MODE_TOOLS: Readonly<Record<BridgeMode, readonly ToolName[]>> = Object.freeze({
+  general: Object.freeze(["codex_status", "codex_task_start", "codex_task_status", "codex_task_cancel", "codex_image_generate"] as const),
+  "image-only": Object.freeze(["codex_status", "codex_image_generate", "codex_task_status", "codex_task_cancel"] as const),
+});
+
+function isToolName(name: string): name is ToolName {
+  return Object.hasOwn(TOOLS, name);
+}
+
 export interface ToolResult {
   [k: string]: unknown;
   content: { type: "text"; text: string }[];
@@ -121,6 +140,10 @@ function err(code: string, message: string): ToolResult {
   return { content: [{ type: "text", text: JSON.stringify(obj) }], structuredContent: obj, isError: true };
 }
 
+function disabled(name: ToolName, mode: BridgeMode): ToolResult {
+  return err("TOOL_DISABLED", `${name} is not available in ${mode} bridge mode (CODEX_BRIDGE_MODE).`);
+}
+
 function exactKeys(args: unknown, keys: string[]): Record<string, unknown> | null {
   if (args === undefined || args === null) return keys.length === 0 ? {} : null;
   if (typeof args !== "object" || Array.isArray(args)) return null;
@@ -144,9 +167,13 @@ export class ToolHandler {
   private readonly createTransport: (cwd: string) => CodexTransport;
   /** Resolved once so status, listing and every job use the same root. */
   readonly outputRoot: OutputRootResolution;
+  /** Resolved once from CODEX_BRIDGE_MODE; fixed for the handler's lifetime (getter only). */
+  readonly #mode: BridgeMode;
 
+  /** Throws BridgeModeError (static message) when CODEX_BRIDGE_MODE is set but invalid. */
   constructor(private readonly deps: ServerDeps = {}) {
     this.env = deps.env ?? process.env;
+    this.#mode = requireBridgeMode(this.env);
     this.outputRoot = resolveOutputRoot(this.env);
     this.jobs = new JobManager(deps.wallMs ?? wallFromEnv(this.env));
     this.createTransport =
@@ -158,12 +185,29 @@ export class ToolHandler {
       });
   }
 
-  /** Always listed; an invalid output root is reported by codex_status and job starts, never hidden. */
-  listTools(): (typeof TOOLS)[keyof typeof TOOLS][] {
-    return [TOOLS.codex_status, TOOLS.codex_task_start, TOOLS.codex_task_status, TOOLS.codex_task_cancel, TOOLS.codex_image_generate];
+  get mode(): BridgeMode {
+    return this.#mode;
+  }
+
+  private exposed(name: ToolName): boolean {
+    return MODE_TOOLS[this.#mode].includes(name);
+  }
+
+  /** In image-only mode only image jobs are visible; others are reported as unknown. */
+  private visibleJob(id: string): JobView | undefined {
+    const v = this.jobs.get(id);
+    return v && (this.#mode === "general" || v.kind === "image") ? v : undefined;
+  }
+
+  /** Mode-dependent; an invalid output root is reported by codex_status and job starts, never hidden. */
+  listTools(): (typeof TOOLS)[ToolName][] {
+    return MODE_TOOLS[this.#mode].map((n) => TOOLS[n]);
   }
 
   async call(name: string, args: unknown): Promise<ToolResult> {
+    // Before any argument, output-root or cwd validation and before any job exists.
+    if (!isToolName(name)) return err("UNKNOWN_TOOL", "Unknown tool.");
+    if (!this.exposed(name)) return disabled(name, this.#mode);
     switch (name) {
       case "codex_status": {
         if (!exactKeys(args, [])) return err("INVALID_ARGUMENTS", "codex_status accepts no arguments.");
@@ -173,7 +217,8 @@ export class ToolHandler {
           this.outputRoot,
           launcherStatus(resolveCodexBin(this.env)),
         );
-        return ok({ ...s, active_job_id: this.jobs.active ?? null });
+        const active = this.jobs.active;
+        return ok({ ...s, bridge_mode: this.#mode, active_job_id: active !== undefined && this.visibleJob(active) ? active : null });
       }
       case "codex_task_start":
       case "codex_image_generate":
@@ -181,13 +226,13 @@ export class ToolHandler {
       case "codex_task_status": {
         const a = exactKeys(args, ["job_id"]);
         if (!a || typeof a.job_id !== "string") return err("INVALID_ARGUMENTS", "Expected {job_id}.");
-        const v = this.jobs.get(a.job_id);
+        const v = this.visibleJob(a.job_id);
         return v ? ok({ ...v }) : err("UNKNOWN_JOB", "No such job.");
       }
       case "codex_task_cancel": {
         const a = exactKeys(args, ["job_id"]);
         if (!a || typeof a.job_id !== "string") return err("INVALID_ARGUMENTS", "Expected {job_id}.");
-        const v = this.jobs.get(a.job_id);
+        const v = this.visibleJob(a.job_id);
         if (!v) return err("UNKNOWN_JOB", "No such job.");
         const cancelled = this.jobs.cancel(a.job_id);
         return ok({ job_id: a.job_id, cancel_requested: cancelled, state: v.state });
@@ -198,6 +243,9 @@ export class ToolHandler {
   }
 
   private async start(name: "codex_task_start" | "codex_image_generate", args: unknown): Promise<ToolResult> {
+    // Re-checked here so no runtime caller can start a hidden or unknown kind.
+    if (name !== "codex_task_start" && name !== "codex_image_generate") return err("UNKNOWN_TOOL", "Unknown tool.");
+    if (!this.exposed(name)) return disabled(name, this.#mode);
     const a = exactKeys(args, ["prompt", "cwd"]);
     if (!a || typeof a.prompt !== "string" || a.prompt.trim().length === 0 || a.prompt.length > MAX_PROMPT_CHARS) {
       return err("INVALID_ARGUMENTS", `Expected {prompt (1..${MAX_PROMPT_CHARS} chars), cwd}.`);
@@ -323,7 +371,16 @@ export function installShutdownHandlers(shutdown: () => Promise<void>, hooks: Sh
   hooks.proc.once("SIGTERM", () => stop(143));
 }
 
+/** Exit status when CODEX_BRIDGE_MODE is invalid: nothing was started. */
+export const EXIT_INVALID_BRIDGE_MODE = 2;
+
 async function main(): Promise<void> {
+  // Validated before any transport exists; the diagnostic is static (the value is never echoed).
+  const mode = resolveBridgeMode(process.env);
+  if (!mode.ok) {
+    process.stderr.write(`codex-claude-bridge: ${mode.message}; not starting.\n`);
+    process.exit(EXIT_INVALID_BRIDGE_MODE);
+  }
   const { server, handler } = buildServer();
   installShutdownHandlers(makeShutdown(handler.jobs), {
     server,

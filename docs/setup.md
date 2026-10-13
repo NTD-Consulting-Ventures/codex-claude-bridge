@@ -110,12 +110,14 @@ claude mcp add --transport stdio --scope user codex-claude-bridge -e CODEX_BIN=â
 
 The name comes **before** any `-e` (Claude reads `-e` as taking several values). Then
 it reads the entry back with `claude mcp get` and requires user scope, `Type: stdio`, the
-exact command, the exact single argument and exactly those two env entries.
+exact command, the exact single argument and exactly those two env entries. With
+`CODEX_BRIDGE_MODE=general|image-only` set, a third entry `-e CODEX_BRIDGE_MODE=<mode>`
+is added and read back too; see [image-only.md](image-only.md).
 
 | script exit | meaning |
 |---|---|
 | 0 | registered and verified (or, without `--apply`, the dry run passed) |
-| 1 | not built, bad arguments, an invalid `CLAUDE_BIN` / `CODEX_BIN` / `CODEX_IMAGE_OUTPUT_ROOT`, or a CLI not found / failing `--version` |
+| 1 | not built, bad arguments, an invalid `CLAUDE_BIN` / `CODEX_BIN` / `CODEX_IMAGE_OUTPUT_ROOT` / `CODEX_BRIDGE_MODE`, or a CLI not found / failing `--version` |
 | 2 | a server named `codex-claude-bridge` or `codex-image-mcp` already exists in some scope; nothing changed |
 | 3 | inconclusive whether both IDs are free; nothing changed |
 | 4 | `mcp add` failed or the readback did not match; **not** confirmed. Inspect with `mcp get` before anything else |
@@ -130,7 +132,9 @@ The script never removes or renames an entry, including after exit 4.
 the registration uses, and reports only whether each exited 0 (their output, which can
 name your account, is not shown). For one that is not signed in it prints the official
 login command with those exact paths, e.g. `PATH='/opt/homebrew/bin':"$PATH" '/opt/homebrew/bin/codex' login`;
-run it yourself. Registration does not require sign-in.
+run it yourself. Registration does not require sign-in. `CODEX_BRIDGE_MODE` is validated
+here too: an invalid value stops it with exit 1 before any CLI is found or run; a valid
+one has no effect on the check.
 
 ### Manual fallback
 
@@ -158,7 +162,8 @@ claude mcp get codex-claude-bridge
 
 Start a **new** Claude Code session (in Claude Desktop, a new Local Code session is
 enough; no need to quit the app), run `/mcp` and confirm `codex-claude-bridge` (or, for
-an older registration, `codex-image-mcp`) is listed with five tools. Ask Claude to call
+an older registration, `codex-image-mcp`) is listed with five tools (four in
+[image-only mode](image-only.md)). Ask Claude to call
 `codex_status`; `runtime` shows the Codex path and launcher kind (`native` or `node_shebang`), the Node path and version, and whether the
 Node directory is put on the children's `PATH`; `image_output` shows the folder in use.
 For a first write test, use an empty throwaway folder (never your home folder) as `cwd`.
@@ -224,7 +229,7 @@ folder, your sign-ins or the clone.
 
 ## Package names
 
-The package is `codex-claude-bridge` (version 0.2.1, not published to npm). The MCP
+The package is `codex-claude-bridge` (version 0.2.2, not published to npm). The MCP
 protocol name is `codex-claude-bridge` and new registrations use that server ID; older
 registrations named `codex-image-mcp` keep working unchanged. Both bin names,
 `codex-claude-bridge` and the legacy alias `codex-image-mcp`, start the same server. The

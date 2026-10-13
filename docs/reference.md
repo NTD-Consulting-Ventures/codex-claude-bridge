@@ -73,7 +73,18 @@ Error codes: `APPROVAL_REQUIRED`, `UNSUPPORTED_SERVER_REQUEST`, `AUTH_REQUIRED`,
 `POLICY_MISMATCH`, `THREAD_START_FAILED`, `TURN_START_FAILED`, `TURN_FAILED`,
 `TURN_INTERRUPTED`, `PROTOCOL_ERROR`, `PROCESS_EXITED`, `OUTPUT_LIMIT`, `SPAWN_FAILED`,
 `NO_IMAGE_PRODUCED`, `IMAGE_ITEM_INVALID`, `IMAGE_VERIFICATION_FAILED`,
-`OUTPUT_ROOT_INVALID`, `OUTPUT_ROOT_UNAVAILABLE`.
+`OUTPUT_ROOT_INVALID`, `OUTPUT_ROOT_UNAVAILABLE`. Tool-call errors: `INVALID_ARGUMENTS`,
+`INVALID_CWD`, `BUSY`, `UNKNOWN_JOB`, `UNKNOWN_TOOL`, `TOOL_DISABLED` (a tool not
+exposed in the current `CODEX_BRIDGE_MODE`).
+
+## Bridge mode
+
+`CODEX_BRIDGE_MODE` (unset = `general`, or `image-only`) is resolved once at server
+start and reported by `codex_status` as `bridge_mode`. `image-only` lists only
+`codex_status`, `codex_image_generate`, `codex_task_status` and `codex_task_cancel`, and
+refuses direct `codex_task_start` calls with `TOOL_DISABLED`; it narrows the MCP tool
+surface only and does not change native Codex capabilities or the launch policy above. See
+[image-only.md](image-only.md).
 
 ## Model selection
 

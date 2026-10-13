@@ -2,6 +2,7 @@
 // builds argv and classifies `claude mcp get` results; spawning stays in the
 // script (discovery: src/discover.ts). ~/.claude.json is never read or written.
 
+import { BRIDGE_MODE_ENV, BRIDGE_MODE_INVALID_MESSAGE, isBridgeMode, resolveBridgeMode, type BridgeMode } from "./bridge-mode.js";
 import { resolveOutputRoot } from "./output-root.js";
 
 /** Server ID used for new registrations. */
@@ -25,13 +26,33 @@ export function resolveRegisteredOutputRoot(env: NodeJS.ProcessEnv, homedir?: ()
   return r.ok ? { ok: true, path: r.path, source: r.source } : { ok: false, reason: r.message };
 }
 
-/** Env persisted into the registration: always the validated absolute Codex path and output root. */
-export function registrationEnv(codex: string, outputRoot: string): Record<string, string> {
-  return { CODEX_BIN: codex, CODEX_IMAGE_OUTPUT_ROOT: outputRoot };
+/**
+ * Bridge mode requested for the registration, resolved by the same resolver
+ * the server uses (src/bridge-mode.ts). `persist` is the mode to store, only
+ * when CODEX_BRIDGE_MODE was explicitly set; unset stores nothing (the server
+ * then defaults to general). Set-but-invalid fails closed with a static reason.
+ */
+export type ModeChoice = { ok: true; mode: BridgeMode; persist: BridgeMode | undefined } | { ok: false; reason: string };
+
+export function resolveRegisteredBridgeMode(env: NodeJS.ProcessEnv): ModeChoice {
+  const r = resolveBridgeMode(env);
+  if (!r.ok) return { ok: false, reason: r.message };
+  return { ok: true, mode: r.mode, persist: r.source === "env" ? r.mode : undefined };
 }
 
-export function addArgs(node: string, serverJs: string, codex: string, outputRoot: string): string[] {
-  const env = Object.entries(registrationEnv(codex, outputRoot)).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+/**
+ * Env persisted into the registration: always the validated absolute Codex
+ * path and output root; CODEX_BRIDGE_MODE only when a mode is passed.
+ */
+export function registrationEnv(codex: string, outputRoot: string, mode?: BridgeMode): Record<string, string> {
+  if (mode !== undefined && !isBridgeMode(mode)) throw new TypeError(BRIDGE_MODE_INVALID_MESSAGE);
+  const env: Record<string, string> = { CODEX_BIN: codex, CODEX_IMAGE_OUTPUT_ROOT: outputRoot };
+  if (mode !== undefined) env[BRIDGE_MODE_ENV] = mode;
+  return env;
+}
+
+export function addArgs(node: string, serverJs: string, codex: string, outputRoot: string, mode?: BridgeMode): string[] {
+  const env = Object.entries(registrationEnv(codex, outputRoot, mode)).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
   // Name must precede -e: claude 2.1.293 parses -e as variadic, so a name placed
   // after the last -e is swallowed as another env entry.
   return ["mcp", "add", "--transport", "stdio", "--scope", "user", SERVER_NAME, ...env, "--", node, serverJs];
@@ -187,7 +208,10 @@ export function verifyReadback(p: ProbeResult, exp: ExpectedRegistration, name: 
     }
     const want = Object.entries(exp.env).sort();
     const got = Object.entries(env).sort();
-    if (JSON.stringify(want) !== JSON.stringify(got)) problems.push("environment: entries differ from the requested CODEX_BIN / CODEX_IMAGE_OUTPUT_ROOT");
+    if (JSON.stringify(want) !== JSON.stringify(got)) problems.push("environment: entries differ from the requested CODEX_BIN / CODEX_IMAGE_OUTPUT_ROOT / CODEX_BRIDGE_MODE");
+    if (exp.env[BRIDGE_MODE_ENV] !== env[BRIDGE_MODE_ENV]) {
+      problems.push(`environment: ${BRIDGE_MODE_ENV} is not the requested ${exp.env[BRIDGE_MODE_ENV] ?? "(unset)"}`);
+    }
   }
   return problems;
 }
