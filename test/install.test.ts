@@ -16,12 +16,15 @@ import {
   KNOWN_SERVER_NAMES,
   LEGACY_SERVER_NAME,
   parseConfiguredList,
+  registrationEnv,
+  resolveRegisteredBridgeMode,
   resolveRegisteredOutputRoot,
   SERVER_NAME,
   verifyReadback,
 } from "../src/install.js";
+import { BRIDGE_MODE_INVALID_MESSAGE, type BridgeMode } from "../src/bridge-mode.js";
 import { launchEnv } from "../src/launch.js";
-import { fakeClaude, fakeCodex, tmpdir } from "./fake-cli.js";
+import { fakeClaude, fakeCodex, nodeScript, tmpdir, writeExec } from "./fake-cli.js";
 
 const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const head = ["mcp", "add", "--transport", "stdio", "--scope", "user", "codex-claude-bridge"];
@@ -42,6 +45,33 @@ test("add argv: name precedes every -e (claude 2.1.293 -e is variadic); CODEX_BI
     "-e", "CODEX_IMAGE_OUTPUT_ROOT=/Users/example-user/Codex Images",
     "--", node, server,
   ]);
+});
+
+const INVALID_MODES = ["", " ", "\t", "Image-Only", "image_only", " image-only", "image-only ", "GENERAL", "SECRET-mode"];
+
+test("bridge mode: optional; unset payload identical to 0.2.1; explicit general|image-only persisted; invalid rejected", () => {
+  const base = registrationEnv("/c/codex", "/o");
+  assert.deepEqual(base, { CODEX_BIN: "/c/codex", CODEX_IMAGE_OUTPUT_ROOT: "/o" });
+  assert.deepEqual(registrationEnv("/c/codex", "/o", undefined), base);
+  assert.deepEqual(addArgs("/n", "/s.js", "/c/codex", "/o", undefined), addArgs("/n", "/s.js", "/c/codex", "/o"));
+  for (const mode of ["general", "image-only"] as const) {
+    assert.deepEqual(registrationEnv("/c/codex", "/o", mode), { ...base, CODEX_BRIDGE_MODE: mode });
+    assert.deepEqual(addArgs("/n", "/s.js", "/c/codex", "/o", mode), [
+      ...head,
+      "-e", "CODEX_BIN=/c/codex",
+      "-e", "CODEX_IMAGE_OUTPUT_ROOT=/o",
+      "-e", `CODEX_BRIDGE_MODE=${mode}`,
+      "--", "/n", "/s.js",
+    ]);
+  }
+  for (const bad of INVALID_MODES) {
+    assert.throws(() => registrationEnv("/c/codex", "/o", bad as BridgeMode), { message: BRIDGE_MODE_INVALID_MESSAGE });
+    assert.throws(() => addArgs("/n", "/s.js", "/c/codex", "/o", bad as BridgeMode), TypeError);
+    assert.deepEqual(resolveRegisteredBridgeMode({ CODEX_BRIDGE_MODE: bad }), { ok: false, reason: BRIDGE_MODE_INVALID_MESSAGE });
+  }
+  assert.deepEqual(resolveRegisteredBridgeMode({}), { ok: true, mode: "general", persist: undefined });
+  assert.deepEqual(resolveRegisteredBridgeMode({ CODEX_BRIDGE_MODE: "general" }), { ok: true, mode: "general", persist: "general" });
+  assert.deepEqual(resolveRegisteredBridgeMode({ CODEX_BRIDGE_MODE: "image-only" }), { ok: true, mode: "image-only", persist: "image-only" });
 });
 
 test("resolved output root (default or override) is forwarded; invalid (incl. empty) fails closed", () => {
@@ -197,6 +227,27 @@ test("readback: exact name, command, args, env and user scope required", () => {
   for (const s of bad) assert.notDeepEqual(verifyReadback(ok0(s), exp), [], s);
   assert.notDeepEqual(verifyReadback({ status: 1, signal: null, stdout: good }, exp), []);
   assert.notDeepEqual(verifyReadback({ status: null, signal: "SIGKILL", stdout: good }, exp), []);
+});
+
+test("readback: the persisted CODEX_BRIDGE_MODE must match the requested mode exactly (or be absent when not requested)", () => {
+  const ok0 = (stdout: string) => ({ status: 0, signal: null, stdout, stderr: "" });
+  const env = { CODEX_BIN: "/c/codex", CODEX_IMAGE_OUTPUT_ROOT: "/o" };
+  const exp = (mode?: string) => ({ node: "/n o/node", serverJs: "/s p/server.js", env: mode === undefined ? env : { ...env, CODEX_BRIDGE_MODE: mode } });
+  const withMode = (line: string) => goodReadback(SERVER_NAME).replace("    CODEX_IMAGE_OUTPUT_ROOT=/o\n", `    CODEX_IMAGE_OUTPUT_ROOT=/o\n${line}`);
+  assert.deepEqual(verifyReadback(ok0(withMode("    CODEX_BRIDGE_MODE=image-only\n")), exp("image-only")), []);
+  assert.deepEqual(verifyReadback(ok0(withMode("    CODEX_BRIDGE_MODE=general\n")), exp("general")), []);
+  const modeProblem = (p: string[]) => p.some((x) => x.startsWith("environment: CODEX_BRIDGE_MODE is not the requested"));
+  for (const [stdout, mode] of [
+    [goodReadback(SERVER_NAME), "image-only"],
+    [withMode("    CODEX_BRIDGE_MODE=general\n"), "image-only"],
+    [withMode("    CODEX_BRIDGE_MODE=image-only \n"), "image-only"],
+    [withMode("    CODEX_BRIDGE_MODE=image-only\n"), undefined],
+    [withMode("    CODEX_BRIDGE_MODE=image-only\n    CODEX_BRIDGE_MODE=image-only\n"), "image-only"],
+  ] as const) {
+    const p = verifyReadback(ok0(stdout), exp(mode));
+    assert.notDeepEqual(p, [], `${mode} ${stdout}`);
+    if (!stdout.includes("CODEX_BRIDGE_MODE=image-only\n    CODEX_BRIDGE_MODE")) assert.ok(modeProblem(p), p.join("; "));
+  }
 });
 
 // --- scripts/register.mjs end to end with fake CLIs ---
@@ -367,4 +418,112 @@ test("register: invalid explicit CODEX_BIN / CLAUDE_BIN fail with no fallback; m
   assert.match(r.stderr, /unexpected version line[\s\S]*npm install -g @openai\/codex/);
   assert.ok(!r.calls.some((c) => c[0] === "mcp"), "nothing probed or registered");
   assert.equal(register(f, ["--force"]).status, 1);
+});
+
+test("register: CODEX_BRIDGE_MODE=image-only dry run shows the mode and its limitation; --apply persists it and verifies readback", () => {
+  const f = fixture();
+  const dry = register(f, [], { CODEX_BRIDGE_MODE: "image-only" });
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /Bridge mode \(env\): image-only \(stored as CODEX_BRIDGE_MODE=image-only\)/);
+  assert.match(dry.stdout, /MCP tool list and refuses direct calls to it \(TOOL_DISABLED\)/);
+  assert.match(dry.stdout, /It is NOT a sandbox: native Codex capabilities are unchanged/);
+  assert.ok(dry.stdout.includes('"-e" "CODEX_BRIDGE_MODE=image-only" "--"'), dry.stdout);
+  assert.deepEqual(gets(dry.calls), [SERVER_NAME, LEGACY_SERVER_NAME]);
+  assert.deepEqual(mutations(dry.calls), []);
+  assert.ok(!existsSync(f.state));
+
+  writeFileSync(f.log, "");
+  const r = register(f, ["--apply"], { CODEX_BRIDGE_MODE: "image-only" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /Registered and verified "codex-claude-bridge" \(user scope, bridge mode image-only\)/);
+  const root = path.join(f.home, "codex-images");
+  const env = { CODEX_BIN: f.codex, CODEX_IMAGE_OUTPUT_ROOT: root, CODEX_BRIDGE_MODE: "image-only" };
+  assert.deepEqual(r.state, { [SERVER_NAME]: { command: process.execPath, args: [serverJs], env, scope: "user" } });
+  assert.deepEqual(mutations(r.calls), [
+    [...head, "-e", `CODEX_BIN=${f.codex}`, "-e", `CODEX_IMAGE_OUTPUT_ROOT=${root}`, "-e", "CODEX_BRIDGE_MODE=image-only", "--", process.execPath, serverJs],
+  ]);
+});
+
+test("register: explicit general is persisted; unset reports the default and stores no mode", () => {
+  const g = fixture();
+  const r = register(g, ["--apply"], { CODEX_BRIDGE_MODE: "general" });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.state[SERVER_NAME].env.CODEX_BRIDGE_MODE, "general");
+  assert.doesNotMatch(r.stdout, /NOT a sandbox/);
+
+  const u = fixture();
+  const dry = register(u, []);
+  assert.equal(dry.status, 0, dry.stderr);
+  assert.match(dry.stdout, /Bridge mode \(default\): general \(CODEX_BRIDGE_MODE not set, so not stored\)/);
+  assert.doesNotMatch(dry.stdout, /CODEX_BRIDGE_MODE=/);
+});
+
+test("register: invalid CODEX_BRIDGE_MODE fails (exit 1) before discovery, probing or any mutation; the value is never echoed", () => {
+  for (const bad of INVALID_MODES) {
+    const f = fixture();
+    for (const args of [[], ["--apply"], ["--check-auth"]]) {
+      const r = register(f, args, { CODEX_BRIDGE_MODE: bad });
+      assert.equal(r.status, 1, JSON.stringify(bad));
+      assert.equal(r.stderr, `${BRIDGE_MODE_INVALID_MESSAGE}; not registering.\n`);
+      assert.equal(r.stdout, "");
+      assert.deepEqual(r.calls, [], "claude was never run");
+      assert.ok(!existsSync(f.state));
+    }
+  }
+});
+
+test("register: a mode never updates an existing canonical or legacy registration (exit 2, unchanged)", () => {
+  const existing = { command: "/old/node", args: ["/old/server.js"], env: { CODEX_IMAGE_OUTPUT_ROOT: "/keep", EXTRA: "x" }, scope: "user" };
+  for (const states of [{ [LEGACY_SERVER_NAME]: existing }, { [SERVER_NAME]: existing }]) {
+    const f = fixture(states);
+    const r = register(f, ["--apply"], { CODEX_BRIDGE_MODE: "image-only" });
+    assert.equal(r.status, 2, r.stderr);
+    assert.deepEqual(r.state, states);
+    assert.deepEqual(mutations(r.calls), []);
+    assert.match(r.stderr, /docs\/image-only\.md/);
+  }
+});
+
+test("register: a persisted mode that reads back differently is never success (exit 4); nothing is removed", () => {
+  const f = fixture();
+  // Wrapper around the fake CLI that changes the stored mode right after `mcp add`.
+  const real = fakeClaude(path.join(f.dir, "real-claude"));
+  writeExec(
+    f.claude,
+    nodeScript(`
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const a = process.argv.slice(2);
+const r = spawnSync(${JSON.stringify(real)}, a, { stdio: "inherit" });
+if (a[0] === "mcp" && a[1] === "add" && r.status === 0) {
+  const st = process.env.FAKE_CLAUDE_STATE;
+  const s = JSON.parse(fs.readFileSync(st, "utf8"));
+  for (const e of Object.values(s)) if (e.env.CODEX_BRIDGE_MODE) e.env.CODEX_BRIDGE_MODE = "general";
+  fs.writeFileSync(st, JSON.stringify(s));
+}
+process.exit(r.status === null ? 1 : r.status);`),
+  );
+  const r = register(f, ["--apply"], { CODEX_BRIDGE_MODE: "image-only" });
+  assert.equal(r.status, 4, r.stderr);
+  assert.match(r.stderr, /NOT confirmed/);
+  assert.match(r.stderr, /CODEX_BRIDGE_MODE is not the requested image-only/);
+  assert.doesNotMatch(r.stdout, /Registered/);
+  assert.ok(!r.calls.some((c) => c[1] === "remove"));
+  assert.equal(r.state[SERVER_NAME].env.CODEX_BRIDGE_MODE, "general", "left as the CLI stored it");
+});
+
+test("register --check-auth: an invalid mode fails (exit 1, no calls); a valid mode only checks sign-in and never touches MCP config", () => {
+  const f = fixture();
+  const bad = register(f, ["--check-auth"], { CODEX_BRIDGE_MODE: "SECRET-mode" });
+  assert.equal(bad.status, 1);
+  assert.equal(bad.stderr, `${BRIDGE_MODE_INVALID_MESSAGE}; not registering.\n`);
+  assert.deepEqual(bad.calls, []);
+  assert.doesNotMatch(bad.stdout + bad.stderr, /SECRET/);
+  assert.ok(!existsSync(f.state));
+  for (const mode of ["general", "image-only"]) {
+    const r = register(f, ["--check-auth"], { CODEX_BRIDGE_MODE: mode });
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(!r.calls.some((c) => c[0] === "mcp"));
+    assert.ok(!existsSync(f.state));
+  }
 });

@@ -1,6 +1,6 @@
 {
   "name": "codex-claude-bridge",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "codex-claude-bridge: trusted-local stdio MCP server that lets Claude Code delegate tasks and native image generation to the locally installed, logged-in Codex CLI. Not a security boundary.",
   "license": "MIT",

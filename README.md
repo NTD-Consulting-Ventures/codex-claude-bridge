@@ -37,7 +37,8 @@ is; an existing `codex-image-mcp` keeps working. Afterwards start a new Claude C
 session (in Claude Desktop, a new Code session is enough).
 
 Images are saved to `~/codex-images` by default. Set `CODEX_IMAGE_OUTPUT_ROOT` to an
-absolute path before registering to use another folder.
+absolute path before registering to use another folder. To list only the image tools,
+see [image-only mode](docs/image-only.md) (opt-in; hides and refuses `codex_task_start`, not a sandbox).
 
 Update in place: `git pull --ff-only && npm ci && npm run build` (no re-registration).
 If a stored path changes, see [Updating](docs/setup.md#updating).
@@ -68,6 +69,7 @@ only; it was not run for this release.
 ## More documentation
 
 - [Setup details, discovery, updating, manual fallback and uninstall](docs/setup.md)
+- [Image-only mode: setup, existing entries and limits](docs/image-only.md)
 - [Security model, tools and protocol](docs/reference.md)
 - [Troubleshooting](docs/troubleshooting.md)
 

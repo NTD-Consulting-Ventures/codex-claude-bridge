@@ -22,6 +22,13 @@
 // current Node (process.execPath) and the image output root are always
 // persisted, so Claude Desktop does not depend on the Terminal's PATH.
 //
+// Bridge mode (src/bridge-mode.ts): CODEX_BRIDGE_MODE=general|image-only is
+// validated with the server's resolver before anything is discovered, probed
+// or added (also with --check-auth, which otherwise ignores it), and persisted as `-e CODEX_BRIDGE_MODE=<mode>` only when set
+// (unset: the same argv as 0.2.1). It changes the listed MCP tools only, not
+// the Codex launch policy (docs/image-only.md). Existing registrations are
+// never updated to a mode by this script.
+//
 // Exit codes: 0 ok / dry run / signed in, 1 setup error, 2 already registered
 // (canonical or legacy ID), 3 could not confirm absence, 4 apply or readback
 // failed, 5 (--check-auth) sign-in not confirmed.
@@ -52,15 +59,27 @@ if (argv.some((a) => a !== "--apply" && a !== "--check-auth") || (apply && check
 if (!path.isAbsolute(node) || !existsSync(serverJs) || !existsSync(path.join(dist, "install.js"))) {
   fail(1, "Build first (npm run build); dist/src/server.js not found.");
 }
-const { addArgs, classifyProbe, describeProbe, registrationEnv, resolveRegisteredOutputRoot, verifyReadback, KNOWN_SERVER_NAMES, SERVER_NAME: NAME } = await import(
-  path.join(dist, "install.js")
-);
+const {
+  addArgs,
+  classifyProbe,
+  describeProbe,
+  registrationEnv,
+  resolveRegisteredBridgeMode,
+  resolveRegisteredOutputRoot,
+  verifyReadback,
+  KNOWN_SERVER_NAMES,
+  SERVER_NAME: NAME,
+} = await import(path.join(dist, "install.js"));
 const { checkClaudeVersion, checkCodexVersion, discoverExecutable, INSTALL_GUIDANCE, spawnRunner } = await import(path.join(dist, "discover.js"));
 const { currentNodeDir, launcherKind, launchEnv } = await import(path.join(dist, "launch.js"));
 
 const deps = { env: process.env, platform: process.platform, home: os.homedir(), execPath: node, run: spawnRunner };
 const nodeDir = currentNodeDir(node);
 
+// Validated in every mode, --check-auth included, before any discovery.
+// Static reason only: the raw CODEX_BRIDGE_MODE value is never echoed.
+const bridgeMode = resolveRegisteredBridgeMode(process.env);
+if (!bridgeMode.ok) fail(1, `${bridgeMode.reason}; not registering.`);
 const outRoot = checkAuth ? null : resolveRegisteredOutputRoot(process.env);
 if (outRoot && !outRoot.ok) fail(1, `${outRoot.reason}; not registering.`);
 
@@ -118,6 +137,16 @@ if (checkAuth) {
 }
 
 out(`Image output root (${outRoot.source}): ${outRoot.path}`);
+out(
+  bridgeMode.persist === undefined
+    ? `Bridge mode (default): ${bridgeMode.mode} (CODEX_BRIDGE_MODE not set, so not stored)`
+    : `Bridge mode (env): ${bridgeMode.mode} (stored as CODEX_BRIDGE_MODE=${bridgeMode.persist})`,
+);
+if (bridgeMode.mode === "image-only") {
+  out("  image-only hides codex_task_start from the MCP tool list and refuses direct calls to it (TOOL_DISABLED).");
+  out("  It is NOT a sandbox: native Codex capabilities are unchanged; image jobs still run under your native");
+  out("  Codex config, plugins and MCP servers (docs/image-only.md).");
+}
 
 const get = (name) => run(claude.path, ["mcp", "get", name]);
 
@@ -132,7 +161,7 @@ if (existing.length > 0) {
     2,
     `An MCP server named ${existing.map((n) => `"${n}"`).join(" and ")} is already registered; not adding another, not overwriting or removing it.${legacy}\n` +
       existing.map((n) => `Inspect it with: ${sq(claude.path)} mcp get ${n}`).join("\n") +
-      "\n(to change paths or Node see docs/setup.md, \"Updating\").",
+      "\n(to change paths or Node see docs/setup.md, \"Updating\"; to opt an existing entry into image-only see docs/image-only.md).",
   );
 }
 const unclear = verdicts.filter((v) => v.verdict !== "absent");
@@ -140,7 +169,7 @@ if (unclear.length > 0) {
   fail(3, unclear.map((v) => `Could not confirm that no MCP server named "${v.name}" exists (claude mcp get: ${describeProbe(v.probe, v.name)}).`).join("\n") + " Not registering.");
 }
 
-const args = addArgs(node, serverJs, codex.path, outRoot.path);
+const args = addArgs(node, serverJs, codex.path, outRoot.path, bridgeMode.persist);
 out(`Command: ${JSON.stringify(claude.path)} ${args.map((a) => JSON.stringify(a)).join(" ")}`);
 if (!apply) {
   out("Dry run. Re-run with --apply to register.");
@@ -151,10 +180,10 @@ const add = spawnSync(claude.path, args, { shell: false, stdio: ["ignore", "inhe
 if (add.error || add.signal !== null || add.status !== 0) {
   fail(4, `claude mcp add failed (${describeProbe(add)}); registration not confirmed.`);
 }
-const problems = verifyReadback(get(NAME), { node, serverJs, env: registrationEnv(codex.path, outRoot.path) }, NAME);
+const problems = verifyReadback(get(NAME), { node, serverJs, env: registrationEnv(codex.path, outRoot.path, bridgeMode.persist) }, NAME);
 if (problems.length > 0) {
   fail(4, `Readback via claude mcp get did not match the requested registration; NOT confirmed:\n  - ${problems.join("\n  - ")}\nInspect with: ${sq(claude.path)} mcp get ${NAME}`);
 }
-out(`Registered and verified "${NAME}" (user scope).`);
+out(`Registered and verified "${NAME}" (user scope, bridge mode ${bridgeMode.mode}).`);
 out("Optional sign-in check: npm run register -- --check-auth");
 out("Start a new Claude Code session (in Claude Desktop: a new Code session) to use it.");

@@ -14,7 +14,7 @@ const MAX_LISTED = 100;
 const MCP_PAGE_LIMIT = 50;
 const MAX_MCP_PAGES = 4;
 const MAX_CURSOR_CHARS = 1024;
-export const SERVER_VERSION = "0.2.1";
+export const SERVER_VERSION = "0.2.2";
 
 export interface VersionProbeResult {
   ok: boolean;

@@ -1,16 +1,33 @@
 // NON-LIVE: version/capability probes and the app-server are fixtures; no Codex process is spawned here.
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdtempSync, mkdirSync, promises as fsp, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { BRIDGE_MODE_INVALID_MESSAGE, BridgeModeError, resolveBridgeMode } from "../src/bridge-mode.js";
 import { MAX_COMPLETED_JOBS } from "../src/jobs.js";
-import { createServer, installShutdownHandlers, makeShutdown, ToolHandler, TOOLS, wallFromEnv, type ServerDeps } from "../src/server.js";
+import {
+  buildServer,
+  createServer,
+  EXIT_INVALID_BRIDGE_MODE,
+  installShutdownHandlers,
+  makeShutdown,
+  MAX_PROMPT_CHARS,
+  MODE_TOOLS,
+  ToolHandler,
+  TOOLS,
+  wallFromEnv,
+  type ServerDeps,
+  type ToolResult,
+} from "../src/server.js";
 import { getStatus, probeCapabilities, sanitizeVersion, summarizeMcpServers, summarizePlugins } from "../src/status.js";
 import { agentMessage, completingScript, defaultReply, FakeAppServer, THREAD_ID, threadStartResult, TURN_ID, turnCompleted } from "./fake-app-server.js";
 
@@ -24,6 +41,12 @@ const tmp = (): string => realpathSync(mkdtempSync(path.join(os.tmpdir(), "cim-"
 function handler(deps: ServerDeps = {}): ToolHandler {
   return new ToolHandler({ versionProbe: okProbe, capabilityProbe: caps, env: {}, wallMs: 2_000, ...deps });
 }
+
+const IMAGE_ONLY = { CODEX_BRIDGE_MODE: "image-only" };
+/** Image-path tests run unchanged under the default (general) mode and under image-only. */
+const MODE_ENVS: readonly (readonly [string, Record<string, string>])[] = [["general", {}], ["image-only", IMAGE_ONLY]];
+/** A second start that must be BUSY; codex_task_start is not exposed in image-only. */
+const startAnother = (h: ToolHandler, cwd: string) => h.call(h.mode === "image-only" ? "codex_image_generate" : "codex_task_start", { prompt: "x", cwd });
 
 async function waitDone(h: ToolHandler, id: string): Promise<Record<string, unknown>> {
   for (let i = 0; i < 200; i++) {
@@ -60,7 +83,7 @@ test("codex_status with no env reports the default root ~/codex-images as enable
   const s = (await handler().call("codex_status", {})).structuredContent as Record<string, any>;
   assert.equal(s.image_generate_enabled, true);
   assert.deepEqual(s.image_output, { root: path.join(os.homedir(), "codex-images"), source: "default", error: null });
-  assert.equal(s.server_version, "0.2.1");
+  assert.equal(s.server_version, "0.2.2");
   const o = (await handler({ env: { CODEX_IMAGE_OUTPUT_ROOT: "/abs/out" } }).call("codex_status", {})).structuredContent as Record<string, any>;
   assert.deepEqual(o.image_output, { root: "/abs/out", source: "env", error: null });
 });
@@ -332,14 +355,15 @@ function imageScript(savedPath: string | null): FakeAppServer {
   );
 }
 
-test("image job verifies native savedPath and copies into owned UUID subdir", async () => {
+for (const [mode, modeEnv] of MODE_ENVS) {
+test(`image job verifies native savedPath and copies into owned UUID subdir (${mode})`, async () => {
   const base = tmp();
   const home = path.join(base, "codex-home");
   mkdirSync(path.join(home, "generated_images"), { recursive: true });
   const src = path.join(home, "generated_images", "img.png");
   writeFileSync(src, PNG);
   const out = path.join(base, "out");
-  const h = handler({ env: { CODEX_HOME: home, CODEX_IMAGE_OUTPUT_ROOT: out }, createTransport: () => imageScript(src) });
+  const h = handler({ env: { CODEX_HOME: home, CODEX_IMAGE_OUTPUT_ROOT: out, ...modeEnv }, createTransport: () => imageScript(src) });
   const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
   const done = await waitDone(h, job_id);
   assert.equal(done.state, "succeeded");
@@ -357,7 +381,7 @@ test("image job verifies native savedPath and copies into owned UUID subdir", as
   assert.equal(readdirSync(out).length, 1);
 });
 
-test("text-only completion is not image success; non-image or outside-home paths fail", async () => {
+test(`text-only completion is not image success; non-image or outside-home paths fail (${mode})`, async () => {
   const base = tmp();
   const home = path.join(base, "codex-home");
   mkdirSync(home);
@@ -366,13 +390,14 @@ test("text-only completion is not image success; non-image or outside-home paths
   const outside = path.join(base, "outside.png");
   writeFileSync(outside, PNG);
   for (const [saved, code] of [[null, "IMAGE_ITEM_INVALID"], [notImg, "IMAGE_VERIFICATION_FAILED"], [outside, "IMAGE_VERIFICATION_FAILED"]] as const) {
-    const h = handler({ env: { CODEX_HOME: home, CODEX_IMAGE_OUTPUT_ROOT: path.join(base, "out") }, createTransport: () => imageScript(saved) });
+    const h = handler({ env: { CODEX_HOME: home, CODEX_IMAGE_OUTPUT_ROOT: path.join(base, "out"), ...modeEnv }, createTransport: () => imageScript(saved) });
     const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
     const done = await waitDone(h, job_id);
     assert.equal(done.state, "failed");
     assert.equal((done.error as any).code, code);
   }
 });
+}
 
 test("delegating tools are conservatively annotated destructive", () => {
   assert.equal(TOOLS.codex_task_start.annotations.destructiveHint, true);
@@ -400,7 +425,11 @@ function gate(): Gate {
   return { entered, release, hold: async () => (enter(), await released) };
 }
 
-function imageFixture(deps: (g: Gate) => ServerDeps, wallMs = 60_000): { h: ToolHandler; g: Gate; out: string; base: string } {
+function imageFixture(
+  deps: (g: Gate) => ServerDeps,
+  wallMs = 60_000,
+  modeEnv: Record<string, string> = {},
+): { h: ToolHandler; g: Gate; out: string; base: string } {
   const base = tmp();
   const home = path.join(base, "codex-home");
   mkdirSync(path.join(home, "generated_images"), { recursive: true });
@@ -408,7 +437,7 @@ function imageFixture(deps: (g: Gate) => ServerDeps, wallMs = 60_000): { h: Tool
   writeFileSync(src, PNG);
   const out = path.join(base, "out");
   const g = gate();
-  const h = handler({ wallMs, env: { CODEX_HOME: home, CODEX_IMAGE_OUTPUT_ROOT: out }, createTransport: () => imageScript(src), ...deps(g) });
+  const h = handler({ wallMs, env: { CODEX_HOME: home, CODEX_IMAGE_OUTPUT_ROOT: out, ...modeEnv }, createTransport: () => imageScript(src), ...deps(g) });
   return { h, g, out, base };
 }
 const afterStep = (step: "mkdir" | "copy") => (g: Gate): ServerDeps => ({ imageAfterStep: async (s) => (s === step ? g.hold() : undefined) });
@@ -421,9 +450,10 @@ const ownedEntries = (out: string): string[] => {
   }
 };
 
+for (const [mode, modeEnv] of MODE_ENVS)
 for (const [label, deps] of [["after-mkdir gate", afterStep("mkdir")], ["after-copy gate", afterStep("copy")], ["in-flight version probe", atVersion]] as const) {
-  test(`cancel during ${label}: stays BUSY until in-flight work settles, then CANCELLED with owned output removed`, async () => {
-    const { h, g, out, base } = imageFixture(deps);
+  test(`cancel during ${label} (${mode}): stays BUSY until in-flight work settles, then CANCELLED with owned output removed`, async () => {
+    const { h, g, out, base } = imageFixture(deps, 60_000, modeEnv);
     const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
     await g.entered;
     assert.equal(ownedEntries(out).length, 1, "owned dir exists while gated");
@@ -432,7 +462,7 @@ for (const [label, deps] of [["after-mkdir gate", afterStep("mkdir")], ["after-c
     assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, false, "second cancel is a no-op");
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(h.jobs.active, job_id, "BUSY is not released while work is outstanding");
-    assert.equal(((await h.call("codex_task_start", { prompt: "x", cwd: base })).structuredContent as any).error.code, "BUSY");
+    assert.equal(((await startAnother(h, base)).structuredContent as any).error.code, "BUSY");
     g.release();
     const done = await waitDone(h, job_id);
     assert.equal(done.state, "cancelled");
@@ -442,8 +472,8 @@ for (const [label, deps] of [["after-mkdir gate", afterStep("mkdir")], ["after-c
     assert.equal(h.jobs.active, undefined);
   });
 
-  test(`deadline during ${label}: TIMEOUT root cause wins over a later cancel; owned output removed`, async () => {
-    const { h, g, out, base } = imageFixture(deps, 150);
+  test(`deadline during ${label} (${mode}): TIMEOUT root cause wins over a later cancel; owned output removed`, async () => {
+    const { h, g, out, base } = imageFixture(deps, 150, modeEnv);
     const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
     await g.entered;
     await new Promise((r) => setTimeout(r, 200));
@@ -458,8 +488,9 @@ for (const [label, deps] of [["after-mkdir gate", afterStep("mkdir")], ["after-c
   });
 }
 
-test("cancel before the deadline stays CANCELLED even when the deadline passes during gated work", async () => {
-  const { h, g, out, base } = imageFixture(atVersion, 150);
+for (const [mode, modeEnv] of MODE_ENVS) {
+test(`cancel before the deadline stays CANCELLED even when the deadline passes during gated work (${mode})`, async () => {
+  const { h, g, out, base } = imageFixture(atVersion, 150, modeEnv);
   const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
   await g.entered;
   await h.call("codex_task_cancel", { job_id });
@@ -470,8 +501,8 @@ test("cancel before the deadline stays CANCELLED even when the deadline passes d
   assert.deepEqual(ownedEntries(out), []);
 });
 
-test("cancel after completion is refused and leaves the succeeded result and files intact", async () => {
-  const { h, g, out, base } = imageFixture(atVersion);
+test(`cancel after completion is refused and leaves the succeeded result and files intact (${mode})`, async () => {
+  const { h, g, out, base } = imageFixture(atVersion, 60_000, modeEnv);
   const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
   await g.entered;
   g.release();
@@ -484,8 +515,8 @@ test("cancel after completion is refused and leaves the succeeded result and fil
   assert.equal(ownedEntries(out).length, 1);
 });
 
-test("version probe failure after collection still succeeds with null version (no output removed)", async () => {
-  const { h, out, base } = imageFixture(() => ({ versionProbe: async () => ({ ok: false, stdout: "" }) }));
+test(`version probe failure after collection still succeeds with null version (no output removed) (${mode})`, async () => {
+  const { h, out, base } = imageFixture(() => ({ versionProbe: async () => ({ ok: false, stdout: "" }) }), 60_000, modeEnv);
   const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
   const done = await waitDone(h, job_id);
   assert.equal(done.state, "succeeded");
@@ -493,8 +524,8 @@ test("version probe failure after collection still succeeds with null version (n
   assert.equal(ownedEntries(out).length, 1);
 });
 
-test("shutdown at the after-copy gate: grace expires without releasing BUSY; release then cancels and cleans up", async () => {
-  const { h, g, out, base } = imageFixture(afterStep("copy"));
+test(`shutdown at the after-copy gate: grace expires without releasing BUSY; release then cancels and cleans up (${mode})`, async () => {
+  const { h, g, out, base } = imageFixture(afterStep("copy"), 60_000, modeEnv);
   const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
   await g.entered;
   let terminations = 0;
@@ -508,6 +539,7 @@ test("shutdown at the after-copy gate: grace expires without releasing BUSY; rel
   assert.deepEqual(ownedEntries(out), []);
   assert.equal(h.jobs.active, undefined);
 });
+}
 
 // True in-flight filesystem gates: the production ToolHandler runs unchanged
 // while a test mock holds the real fsp.mkdir(outputRoot) / destination
@@ -527,8 +559,8 @@ async function within<T>(p: Promise<T>, what: string, ms = 2_000): Promise<T> {
   }
 }
 
-function inFlightFixture(wallMs: number): { h: ToolHandler; g: Gate; out: string; base: string; src: string } {
-  const f = imageFixture(() => ({}), wallMs);
+function inFlightFixture(wallMs: number, modeEnv: Record<string, string> = {}): { h: ToolHandler; g: Gate; out: string; base: string; src: string } {
+  const f = imageFixture(() => ({}), wallMs, modeEnv);
   mkdirSync(f.out);
   writeFileSync(path.join(f.out, "sentinel.txt"), "keep");
   return { ...f, src: path.join(f.base, "codex-home", "generated_images", "img.png") };
@@ -540,11 +572,12 @@ function assertIntact(out: string, src: string): void {
   assert.deepEqual(readFileSync(src), PNG, "source image intact");
 }
 
+for (const [bridgeMode, modeEnv] of MODE_ENVS)
 for (const mode of ["deadline", "cancel"] as const) {
   const code = mode === "deadline" ? "TIMEOUT" : "CANCELLED";
 
-  test(`in-flight fsp.mkdir(outputRoot) held (${mode}): BUSY until mkdir returns, then ${code}, never succeeded`, { timeout: 10_000 }, async (t) => {
-    const { h, g, out, base, src } = inFlightFixture(mode === "deadline" ? 50 : 60_000);
+  test(`in-flight fsp.mkdir(outputRoot) held (${mode}, ${bridgeMode}): BUSY until mkdir returns, then ${code}, never succeeded`, { timeout: 10_000 }, async (t) => {
+    const { h, g, out, base, src } = inFlightFixture(mode === "deadline" ? 50 : 60_000, modeEnv);
     const realMkdir = fsp.mkdir;
     t.mock.method(fsp, "mkdir", async (p: unknown, ...rest: unknown[]) => {
       if (p === out) await g.hold();
@@ -557,7 +590,7 @@ for (const mode of ["deadline", "cancel"] as const) {
       await sleep(100);
       assert.equal(h.jobs.active, job_id, "BUSY while mkdir is in flight");
       assert.equal(h.jobs.get(job_id)?.state, "running");
-      assert.equal(((await h.call("codex_task_start", { prompt: "x", cwd: base })).structuredContent as any).error.code, "BUSY");
+      assert.equal(((await startAnother(h, base)).structuredContent as any).error.code, "BUSY");
       assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, false, "late cancel refused");
       assert.deepEqual(ownedEntries(out), ["sentinel.txt"], "no owned dir created yet");
     } finally {
@@ -571,8 +604,8 @@ for (const mode of ["deadline", "cancel"] as const) {
     assert.equal(h.jobs.active, undefined);
   });
 
-  test(`in-flight destination writeFile held (${mode}): BUSY, write not abandoned, then ${code} with owned output removed`, { timeout: 10_000 }, async (t) => {
-    const { h, g, out, base, src } = inFlightFixture(mode === "deadline" ? 50 : 60_000);
+  test(`in-flight destination writeFile held (${mode}, ${bridgeMode}): BUSY, write not abandoned, then ${code} with owned output removed`, { timeout: 10_000 }, async (t) => {
+    const { h, g, out, base, src } = inFlightFixture(mode === "deadline" ? 50 : 60_000, modeEnv);
     const events: string[] = [];
     let dest: string | undefined;
     const realOpen = fsp.open;
@@ -601,7 +634,7 @@ for (const mode of ["deadline", "cancel"] as const) {
       if (mode === "cancel") assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, true);
       await sleep(100);
       assert.equal(h.jobs.active, job_id, "BUSY while the destination write is in flight");
-      assert.equal(((await h.call("codex_task_start", { prompt: "x", cwd: base })).structuredContent as any).error.code, "BUSY");
+      assert.equal(((await startAnother(h, base)).structuredContent as any).error.code, "BUSY");
       assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, false, "late cancel refused");
       assert.deepEqual(events, ["write-start"], "no cleanup while the write is outstanding");
       assert.ok(dest !== undefined && existsSync(dest), "destination exists while write is held");
@@ -625,6 +658,22 @@ test("shutdown cancels the active job, interrupts its turn, kills it, then termi
   const fake = new FakeAppServer();
   const h = handler({ wallMs: 60_000, createTransport: () => fake });
   const { job_id } = (await h.call("codex_task_start", { prompt: "long", cwd })).structuredContent as { job_id: string };
+  await new Promise((r) => setTimeout(r, 10));
+  let terminations = 0;
+  const shutdown = makeShutdown(h.jobs, async () => void terminations++, 1_000);
+  await Promise.all([shutdown(), shutdown()]);
+  assert.equal(terminations, 1);
+  assert.equal(h.jobs.active, undefined);
+  assert.equal((await waitDone(h, job_id)).state, "cancelled");
+  assert.ok(fake.methods().includes("turn/interrupt"));
+  assert.equal(fake.killed, true);
+});
+
+test("shutdown (image-only) cancels the active image job, interrupts its turn, kills it, then terminates all app-servers once", async () => {
+  const cwd = tmp();
+  const fake = new FakeAppServer();
+  const h = handler({ wallMs: 60_000, env: { ...IMAGE_ONLY, CODEX_IMAGE_OUTPUT_ROOT: path.join(cwd, "out") }, createTransport: () => fake });
+  const { job_id } = (await h.call("codex_image_generate", { prompt: "long", cwd })).structuredContent as { job_id: string };
   await new Promise((r) => setTimeout(r, 10));
   let terminations = 0;
   const shutdown = makeShutdown(h.jobs, async () => void terminations++, 1_000);
@@ -753,13 +802,25 @@ test("codex_task_start fails clearly on missing/unsupported/unverifiable/excess 
   assert.deepEqual(readFileSync(f.png), PNG, "source intact");
 });
 
-test("codex_image_generate: a text-only completion is NO_IMAGE_PRODUCED", async () => {
-  const f = taskImageFixture();
-  const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: f.out }, createTransport: () => new FakeAppServer(completingScript([agentMessage("no"), turnCompleted()])) });
-  const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: f.base })).structuredContent as { job_id: string };
-  assert.equal(((await waitDone(h, job_id)).error as any).code, "NO_IMAGE_PRODUCED");
-  assert.deepEqual(ownedEntries(f.out), []);
-});
+for (const [mode, modeEnv] of MODE_ENVS) {
+  test(`codex_image_generate: a text-only completion is NO_IMAGE_PRODUCED (${mode})`, async () => {
+    const f = taskImageFixture();
+    const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: f.out, ...modeEnv }, createTransport: () => new FakeAppServer(completingScript([agentMessage("no"), turnCompleted()])) });
+    const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: f.base })).structuredContent as { job_id: string };
+    assert.equal(((await waitDone(h, job_id)).error as any).code, "NO_IMAGE_PRODUCED");
+    assert.deepEqual(ownedEntries(f.out), []);
+  });
+
+  test(`codex_image_generate saves a native JPEG too (${mode})`, async () => {
+    const f = taskImageFixture();
+    const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: f.out, ...modeEnv }, createTransport: () => new FakeAppServer(completingScript([imgItem("g", f.jpg), turnCompleted()])) });
+    const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: f.base })).structuredContent as { job_id: string };
+    const done = await waitDone(h, job_id);
+    assert.equal(done.state, "succeeded");
+    assert.deepEqual((done.result as any).files.map((x: any) => [x.mime_type, x.sha256]), [["image/jpeg", sha(JPEG)]]);
+    assert.match(path.relative(f.out, (done.result as any).files[0].path), /^[0-9a-f-]{36}\/[0-9a-f-]{36}\.jpg$/);
+  });
+}
 
 test("symlinked output root (or ancestor) gets no writes: OUTPUT_ROOT_UNAVAILABLE", async () => {
   const f = taskImageFixture();
@@ -820,4 +881,219 @@ test("launch policy regression: task with images still uses cwd-only workspace-w
   assert.equal(tr.approvalPolicy, "on-request");
   assert.deepEqual(tr.sandboxPolicy, { type: "workspaceWrite", writableRoots: [f.base], networkAccess: false, excludeSlashTmp: true, excludeTmpdirEnvVar: true });
   assert.ok(!JSON.stringify(fake.received).includes(f.out), "output root never sent to Codex");
+});
+
+// --- Bridge mode (CODEX_BRIDGE_MODE) ---
+
+const GENERAL_TOOLS = ["codex_status", "codex_task_start", "codex_task_status", "codex_task_cancel", "codex_image_generate"];
+const IMAGE_ONLY_TOOLS = ["codex_status", "codex_image_generate", "codex_task_status", "codex_task_cancel"];
+const INVALID_MODES = ["", " ", "\t", "\n", "Image-Only", "IMAGE-ONLY", "image_only", "imageonly", " image-only", "image-only ", "general\n", "GENERAL", "task", "SECRET-mode"];
+const code = (r: ToolResult): string => (r.structuredContent as any).error.code;
+const jobCount = (h: ToolHandler): number => (h.jobs as any).jobs.size;
+const serverJs = path.join(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."), "dist", "src", "server.js");
+
+test("bridge mode resolver: unset is general; only exact general|image-only accepted; invalid gives a static diagnostic", () => {
+  assert.deepEqual(resolveBridgeMode({}), { ok: true, mode: "general", source: "default" });
+  assert.deepEqual(resolveBridgeMode({ CODEX_BRIDGE_MODE: "general" }), { ok: true, mode: "general", source: "env" });
+  assert.deepEqual(resolveBridgeMode(IMAGE_ONLY), { ok: true, mode: "image-only", source: "env" });
+  assert.match(BRIDGE_MODE_INVALID_MESSAGE, /CODEX_BRIDGE_MODE/);
+  for (const bad of INVALID_MODES) {
+    assert.deepEqual(resolveBridgeMode({ CODEX_BRIDGE_MODE: bad }), { ok: false, message: BRIDGE_MODE_INVALID_MESSAGE }, JSON.stringify(bad));
+    assert.throws(() => handler({ env: { CODEX_BRIDGE_MODE: bad } }), (e: unknown) => e instanceof BridgeModeError && e.message === BRIDGE_MODE_INVALID_MESSAGE);
+  }
+});
+
+test("tool discovery: unset and general list the existing five definitions unchanged; image-only exactly four existing ones", () => {
+  for (const env of [{}, { CODEX_BRIDGE_MODE: "general" }]) {
+    const tools = handler({ env }).listTools();
+    assert.deepEqual(tools.map((t) => t.name), GENERAL_TOOLS);
+    for (const t of tools) assert.equal(t, TOOLS[t.name as keyof typeof TOOLS]);
+  }
+  const io = handler({ env: IMAGE_ONLY }).listTools();
+  assert.deepEqual(io.map((t) => t.name), IMAGE_ONLY_TOOLS);
+  for (const t of io) assert.equal(t, TOOLS[t.name as keyof typeof TOOLS]);
+  assert.ok(Object.isFrozen(MODE_TOOLS) && Object.isFrozen(MODE_TOOLS.general) && Object.isFrozen(MODE_TOOLS["image-only"]));
+});
+
+test("codex_status reports bridge_mode and 0.2.2 in every mode; default and custom roots unchanged", async () => {
+  for (const [env, mode] of [[{}, "general"], [{ CODEX_BRIDGE_MODE: "general" }, "general"], [IMAGE_ONLY, "image-only"]] as const) {
+    const s = (await handler({ env }).call("codex_status", {})).structuredContent as Record<string, any>;
+    assert.equal(s.bridge_mode, mode);
+    assert.equal(s.server_version, "0.2.2");
+    assert.equal(s.active_job_id, null);
+    assert.equal(s.launch.sandbox, "workspace-write");
+    assert.equal(s.launch.approval_policy, "on-request");
+    assert.deepEqual(s.image_output, { root: path.join(os.homedir(), "codex-images"), source: "default", error: null });
+  }
+  const o = (await handler({ env: { ...IMAGE_ONLY, CODEX_IMAGE_OUTPUT_ROOT: "/abs/out" } }).call("codex_status", {})).structuredContent as Record<string, any>;
+  assert.deepEqual(o.image_output, { root: "/abs/out", source: "env", error: null });
+  assert.equal((await handler({ env: IMAGE_ONLY }).call("codex_status", { bridge_mode: "general" })).isError, true, "no per-call override");
+});
+
+test("bridge mode is fixed for the handler's lifetime: env mutation and assignment do not change it", async () => {
+  const env: NodeJS.ProcessEnv = { ...IMAGE_ONLY };
+  const h = handler({ env });
+  env.CODEX_BRIDGE_MODE = "general";
+  assert.equal(h.mode, "image-only");
+  assert.deepEqual(h.listTools().map((t) => t.name), IMAGE_ONLY_TOOLS);
+  delete env.CODEX_BRIDGE_MODE;
+  assert.equal(((await h.call("codex_status", {})).structuredContent as any).bridge_mode, "image-only");
+  assert.throws(() => ((h as any).mode = "general"), TypeError);
+  assert.equal(h.mode, "image-only");
+  assert.equal(code(await h.call("codex_task_start", { prompt: "x", cwd: tmp() })), "TOOL_DISABLED");
+
+  const genv: NodeJS.ProcessEnv = {};
+  const g = handler({ env: genv });
+  genv.CODEX_BRIDGE_MODE = "image-only";
+  assert.equal(g.mode, "general");
+  assert.deepEqual(g.listTools().map((t) => t.name), GENERAL_TOOLS);
+});
+
+test("image-only: direct codex_task_start is TOOL_DISABLED before argument, output-root or cwd checks; no job, no spawn, no writes", async () => {
+  for (const root of [undefined, "", "rel/SECRET"]) {
+    let spawned = 0;
+    const env: NodeJS.ProcessEnv = root === undefined ? { ...IMAGE_ONLY } : { ...IMAGE_ONLY, CODEX_IMAGE_OUTPUT_ROOT: root };
+    const h = handler({ env, createTransport: () => (spawned++, new FakeAppServer(completingScript([turnCompleted()]))) });
+    const cwd = tmp();
+    const argsList: unknown[] = [
+      { prompt: "x", cwd },
+      undefined,
+      null,
+      {},
+      [],
+      "SECRET",
+      { prompt: "", cwd },
+      { prompt: "x".repeat(MAX_PROMPT_CHARS + 1), cwd },
+      { prompt: "x", cwd: "relative/SECRET" },
+      { prompt: "x", cwd: "/" },
+      { prompt: "x", cwd, model: "SECRET" },
+    ];
+    for (const args of argsList) {
+      const r = await h.call("codex_task_start", args);
+      assert.equal(r.isError, true);
+      assert.equal(code(r), "TOOL_DISABLED", `${String(root)} ${JSON.stringify(args)?.slice(0, 40)}`);
+      assert.ok(!JSON.stringify(r).includes("SECRET"));
+    }
+    assert.equal(h.jobs.active, undefined);
+    assert.equal(jobCount(h), 0, "no job allocated");
+    assert.equal(spawned, 0, "nothing spawned");
+    assert.deepEqual(readdirSync(cwd), []);
+    // The exposed image tool keeps its normal validation order.
+    if (root !== undefined) assert.equal(code(await h.call("codex_image_generate", { prompt: "x", cwd })), "OUTPUT_ROOT_INVALID");
+  }
+});
+
+test("private start re-checks the name at runtime: hidden kind TOOL_DISABLED, unknown names UNKNOWN_TOOL; no job, no spawn", async () => {
+  for (const env of [{}, IMAGE_ONLY]) {
+    let spawned = 0;
+    const h = handler({ env, createTransport: () => (spawned++, new FakeAppServer()) });
+    const cwd = tmp();
+    const start = (n: string): Promise<ToolResult> => (h as any).start(n, { prompt: "x", cwd });
+    const unknown = ["bogus", "__proto__", "constructor", "toString", "hasOwnProperty", "", "codex_task_start ", "CODEX_TASK_START", "codex_image_edit"];
+    for (const n of unknown) {
+      assert.equal(code(await h.call(n, { prompt: "x", cwd })), "UNKNOWN_TOOL", n);
+      assert.equal(code(await start(n)), "UNKNOWN_TOOL", n);
+    }
+    for (const n of ["codex_status", "codex_task_status", "codex_task_cancel"]) assert.equal(code(await start(n)), "UNKNOWN_TOOL", n);
+    if (h.mode === "image-only") assert.equal(code(await start("codex_task_start")), "TOOL_DISABLED");
+    assert.equal(jobCount(h), 0);
+    assert.equal(spawned, 0);
+  }
+});
+
+test("MCP protocol (image-only): tools/list has four tools; hidden and unknown calls refused with no job and no spawn", async () => {
+  let spawned = 0;
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  const { server, handler: h } = buildServer({ versionProbe: okProbe, capabilityProbe: caps, env: { ...IMAGE_ONLY }, createTransport: () => (spawned++, new FakeAppServer()) });
+  await server.connect(st);
+  const client = new Client({ name: "test", version: "0" });
+  await client.connect(ct);
+  const { tools } = await client.listTools();
+  assert.deepEqual(tools.map((t) => t.name), IMAGE_ONLY_TOOLS);
+  const cwd = tmp();
+  const hidden = (await client.callTool({ name: "codex_task_start", arguments: { prompt: "x", cwd } })) as ToolResult;
+  assert.equal(hidden.isError, true);
+  assert.equal(code(hidden), "TOOL_DISABLED");
+  assert.equal(code((await client.callTool({ name: "codex_task_start", arguments: { bad: 1 } })) as ToolResult), "TOOL_DISABLED");
+  assert.equal(code((await client.callTool({ name: "codex_shell", arguments: {} })) as ToolResult), "UNKNOWN_TOOL");
+  const s = (await client.callTool({ name: "codex_status", arguments: {} })).structuredContent as any;
+  assert.equal(s.bridge_mode, "image-only");
+  assert.equal(s.active_job_id, null);
+  assert.equal(spawned, 0);
+  assert.equal(h.jobs.active, undefined);
+  assert.equal(jobCount(h), 0);
+  await client.close();
+  await server.close();
+});
+
+test("image-only: an internally started task-kind job is UNKNOWN_JOB to poll and cancel; never cancelled, result never exposed", async () => {
+  const h = handler({ env: { ...IMAGE_ONLY }, wallMs: 60_000 });
+  const g = gate();
+  let signal: AbortSignal | undefined;
+  const view = h.jobs.start("task", async (s) => {
+    signal = s;
+    await g.hold();
+    return { text: "SECRET-result" };
+  })!;
+  await g.entered;
+  const id = view.job_id;
+  for (const tool of ["codex_task_status", "codex_task_cancel"]) {
+    const r = await h.call(tool, { job_id: id });
+    assert.equal(code(r), "UNKNOWN_JOB", tool);
+  }
+  assert.equal(signal!.aborted, false, "cancel did not reach the hidden job");
+  assert.equal(h.jobs.get(id)?.state, "running");
+  assert.equal(((await h.call("codex_status", {})).structuredContent as any).active_job_id, null);
+  // The single-active policy still holds.
+  assert.equal(code(await h.call("codex_image_generate", { prompt: "x", cwd: tmp() })), "BUSY");
+  g.release();
+  for (let i = 0; i < 200 && h.jobs.get(id)?.state === "running"; i++) await sleep(5);
+  assert.equal(h.jobs.get(id)?.state, "succeeded");
+  for (const tool of ["codex_task_status", "codex_task_cancel"]) {
+    const r = await h.call(tool, { job_id: id });
+    assert.equal(code(r), "UNKNOWN_JOB", tool);
+    assert.ok(!JSON.stringify(r).includes("SECRET"));
+  }
+  assert.deepEqual(h.jobs.get(id)?.result, { text: "SECRET-result" }, "internal state untouched");
+
+  // The same kind stays visible in general mode.
+  const gen = handler({ wallMs: 60_000 });
+  const gv = gen.jobs.start("task", async () => ({ text: "ok" }))!;
+  for (let i = 0; i < 200 && gen.jobs.get(gv.job_id)?.state === "running"; i++) await sleep(5);
+  assert.equal(((await gen.call("codex_task_status", { job_id: gv.job_id })).structuredContent as any).state, "succeeded");
+});
+
+test("server CLI: invalid CODEX_BRIDGE_MODE exits before any transport with a static stderr diagnostic and no stdout", () => {
+  for (const bad of ["", " ", "image_only", "SECRET-mode"]) {
+    const r = spawnSync(process.execPath, [serverJs], {
+      input: "",
+      encoding: "utf8",
+      timeout: 10_000,
+      env: { PATH: process.env.PATH ?? "", HOME: tmp(), CODEX_BIN: "/nonexistent/codex", CODEX_BRIDGE_MODE: bad },
+    });
+    assert.equal(r.status, EXIT_INVALID_BRIDGE_MODE, JSON.stringify(bad));
+    assert.equal(r.stdout, "");
+    assert.equal(r.stderr, `codex-claude-bridge: ${BRIDGE_MODE_INVALID_MESSAGE}; not starting.\n`);
+    assert.ok(!r.stderr.includes("SECRET"));
+  }
+});
+
+test("server CLI (image-only) over real stdio: tools/list has four tools, codex_task_start is TOOL_DISABLED", { timeout: 20_000 }, async () => {
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [serverJs],
+    env: { CODEX_BRIDGE_MODE: "image-only", CODEX_BIN: "/nonexistent/codex", HOME: tmp() },
+    stderr: "pipe",
+  });
+  const client = new Client({ name: "test", version: "0" });
+  await client.connect(transport);
+  try {
+    assert.deepEqual((await client.listTools()).tools.map((t) => t.name), IMAGE_ONLY_TOOLS);
+    assert.equal(code((await client.callTool({ name: "codex_task_start", arguments: { prompt: "x", cwd: tmp() } })) as ToolResult), "TOOL_DISABLED");
+    const s = (await client.callTool({ name: "codex_status", arguments: {} })).structuredContent as any;
+    assert.equal(s.bridge_mode, "image-only");
+    assert.equal(s.active_job_id, null);
+  } finally {
+    await client.close();
+  }
 });
