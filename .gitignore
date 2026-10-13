@@ -3,9 +3,17 @@ research/
 .protocol-research/
 .app-server-reference.md
 
+# Dependencies / build
+node_modules/
+dist/
+
 # Harness logs and evidence
+.harness/
 .harness-evidence/
 *.log
+
+# Live smoke workspaces, outputs and evidence (parent-controlled runs)
+.smoke/
 
 # Generated outputs
 outputs/
