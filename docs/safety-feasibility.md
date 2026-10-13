@@ -1,3 +1,18 @@
+> ## ⚠️ SUPERSEDED — historical record only
+>
+> This audit evaluated an **image-only, isolated-home** design. A later user/operator scope
+> change (task t_565ce4e9, phase 6) replaced that goal with a **general trusted-local Codex
+> delegation** server that deliberately uses the normal Codex home/config/login, plugins and
+> MCP servers, under native `on-request` approvals and `read-only` sandbox. The project makes
+> **no image-only or isolation claim**. The verdict below answers a question the project no
+> longer asks; see README.md for the current trust model.
+>
+> **Harness run history (later phases):** phase 5 succeeded (recorded as 37 / 282110);
+> phase 6 was interrupted by a gateway 420 error with an empty result; phase 7 hit the 360 s wall
+> timeout mid-edit with no result; phase 8 succeeded (recorded as 35 / 90862). The follow-up repair wired `resolveCodexBin` and an explicit validated cwd into the
+> transport factory and carries safe RPC error enums into job errors. No result of a live run
+> is recorded or predicted here.
+
 # Safety Feasibility Gate — codex-cli 0.156.0 image-only operation
 
 **Verdict: BLOCKED (not proven safe).** This is a *source-audit* verdict. It is not a finding
@@ -11,7 +26,8 @@ Each item below is labelled with one of:
 - **UNRESOLVED**: the audit did not reach a conclusion. This is not evidence of impossibility.
 - **NOT POSSIBLE via route X**: the source shows that route cannot satisfy the requirement.
 
-No implementation was scaffolded. No test, model turn or image generation was executed in any phase.
+No implementation was scaffolded. No test, model turn or image generation was executed in any phase
+(phase 4 included; see "Phase 4 additions").
 
 ## Scope of evidence (what was and was not done)
 
@@ -222,13 +238,43 @@ per-destination policy for in-process traffic was found in the fetched files.
 Status: restricting network to the image backend only is UNRESOLVED. An external
 (OS/firewall-level) control may be needed. That would be a separate decision.
 
+## Phase 4 additions (rust-v0.156.0, newly fetched files, line numbers checked locally)
+
+Newly fetched with bounded `curl --fail --max-time --max-filesize` from
+`raw.githubusercontent.com/openai/codex/rust-v0.156.0` only: `ext/goal/src/runtime.rs`,
+`ext/agent-message-board/src/{lib,host}.rs`, `ext/git-attribution/src/lib.rs`,
+`ext/guardian-v2/src/lib.rs`, `ext/mcp/src/{lib,plugin_contributor}.rs`,
+`core/src/hook_runtime.rs`, `ext/skills/src/config.rs`. Nothing else was executed: no
+`app-server` process, no login, no model turn, no generation, no config/credential reads.
+
+| Contributor | New evidence | Status |
+|---|---|---|
+| goal | `ext/goal/src/runtime.rs:126-128`: `tools_visible() = is_enabled() && tools_visible_for_thread`; `enabled` is seeded from `config.enabled` (`:110`), which app-server derives from `Feature::Goals` (`app-server/src/extensions.rs:84-87`) | ACHIEVABLE via `features.goals=false` (scalar override replaces, `merge.rs:149-150`), untested. `set_enabled` (`:118-120`) can flip it at runtime; callers not traced |
+| git-attribution | `ext/git-attribution/src/lib.rs:32-95, 98-109`: installs only a `ContextContributor` (`prompt_contributor`), **no tools**. It performs an HTTP call `resolve_attribution_policy(auth_manager, base_url, http_client_factory)` (`:53-58`) and contributes prompt text | Not a tool source (ENFORCED by source shape). It is an **in-process backend network call** using the official auth/base URL, not model-directed tool network; no gate found to disable it |
+| guardian-v2 | `ext/guardian-v2/src/lib.rs:15-22` installs `async_scorer` and `sync_reviewer`; their modules were not fetched | UNRESOLVED (no tool/gate evidence either way) |
+| MCP (hosted apps) | `ext/mcp/src/lib.rs:43-61`: if `Feature::Apps` is disabled the contributor returns `McpServerContribution::Remove { name: CODEX_APPS_MCP_SERVER_NAME }`; otherwise adds the hosted apps server at `chatgpt_base_url` | ACHIEVABLE via `features.apps=false`, untested |
+| MCP plugins | `ext/mcp/src/plugin.rs:123`, `:207`: plugin MCP servers only when `Feature::Plugins` is enabled | ACHIEVABLE via `features.plugins=false`, untested |
+| skills | `ext/skills/src/extension.rs:271-287` → `build_skill_tools` (`:559-576`) → `skill_tools(self.providers, …)`; **no feature gate in the contributor**. Tools depend on what providers return; `skill_tools` and the providers were not fetched | UNRESOLVED. With an isolated, empty `CODEX_HOME` and no project cwd the user/project skill catalogs should be empty, but bundled/orchestrator/plugin skills were not ruled out |
+| agent-message-board | `ext/agent-message-board/src/extension.rs:45-73`: a `Binding` (which gates tools, `:86-103`) is inserted on thread start iff the injected `open` factory returns `Some(board)` (`:57`). The factory is supplied by `codex_core::install_agent_message_board` (not fetched) | UNRESOLVED; the gate is in core, not traced |
+| hooks | `core/src/hook_runtime.rs` fetched but not yet analysed within the phase-4 budget | UNRESOLVED |
+
+**Network distinction.** Legitimate official-backend traffic (expected, not a blocker by itself):
+image generation via the provider (`ext/image-generation/src/extension.rs:97-103`),
+git-attribution policy fetch (`ext/git-attribution/src/lib.rs:53-58`), and any auth refresh.
+Unwanted *tool-access* network would be `web.run` (gated, A2), the hosted apps MCP server
+(`ext/mcp/src/lib.rs:54-61`, gated by `features.apps`), plugin MCP servers (`plugin.rs:207`),
+and any user MCP servers (excluded by an isolated `CODEX_HOME`, A3). No decisive source-level
+incompatibility was found in phase 4; every newly traced item is either gated or not a tool.
+
 ## Remaining blockers (precise)
 
 1. **No machine-enforced allowlist is reachable** (A1, proven for app-server/schema). Safety rests
    on a denylist, so it rests on 2–5.
-2. **Incomplete contributor audit** (A2): the skills, goal (`tools_visible`), agent-message-board
-   (`Binding`), git-attribution, guardian-v2, queue and mcp crates, plus the browser_use/
-   computer_use/apps/plugins gates, are not traced to a disabling config.
+2. **Incomplete contributor audit** (A2, updated in phase 4): goal, apps-MCP and plugin-MCP are now
+   traced to feature gates; git-attribution is proven to be prompt-only (no tools). Still
+   untraced: skills providers/`skill_tools`, the agent-message-board `open` factory in core,
+   guardian-v2 submodules, queue, history-notes/memories config derivation, and the
+   browser_use/computer_use/multi_agent gates.
 3. **System/managed config layers** are inherited and unverifiable without reading host config
    (A3).
 4. **Hooks:** it is not verified that `features.hooks=false` suppresses all hook execution (A3).

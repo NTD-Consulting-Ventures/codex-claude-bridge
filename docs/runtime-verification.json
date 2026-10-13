@@ -1,0 +1,58 @@
+{
+  "note": "Sanitized live-run record. Parent-controlled runs; results as reported by the parent and by the referenced git-ignored evidence files. No image bytes, base64, config, account or credential data embedded. Configured MCP server/plugin names are not stored.",
+  "environment": {
+    "codex_cli": "codex-cli 0.156.0 (official, installed, logged in normally)",
+    "claude_cli": "2.1.293",
+    "status": "experimental; verified only against these versions"
+  },
+  "checks": {
+    "commands": ["npm run typecheck", "npm run lint", "npm test", "npm run build"],
+    "result": "pass; 110/110 node:test fixtures (parent npm ci/typecheck/ESLint/test/build/npm audit 0 vulnerabilities after phase 12). Fixtures never spawn Codex or claude."
+  },
+  "live_runs": [
+    {
+      "name": "mcp_status",
+      "command": "node scripts/smoke.mjs status",
+      "evidence": ".smoke/b229da41-05ce-48db-a0b9-1864853dfc8b/evidence.json",
+      "result": "succeeded; plugin and MCP server name listings complete, truncated=false"
+    },
+    {
+      "name": "general_task",
+      "command": "node scripts/smoke.mjs task",
+      "evidence": ".smoke/c1abd1f3-637a-4e57-b51d-9b9508d0169d/evidence.json",
+      "result": "succeeded; result text PONG"
+    },
+    {
+      "name": "image_generation",
+      "command": "node scripts/smoke.mjs image --confirm-spend-one-image",
+      "native_images_generated": 1,
+      "generated_at_local": "10:31:23",
+      "result": "MCP job failed with OUTPUT_LIMIT: the completed imageGeneration item (inline base64) exceeded the then frame bound. Job status remains failed; it was not re-run.",
+      "repair": "Frame bound raised to 8 MiB; fixture test with a ~1.3 MiB image frame added. No second generation."
+    },
+    {
+      "name": "read_only_recovery",
+      "command": "node scripts/recover-smoke-image.mjs (official thread/read on the bridge's own thread; no new turn)",
+      "evidence": ".smoke/recovered-owned/evidence-68951dd7-270e-4160-ba19-8ae9a703df72.json",
+      "result": "native savedPath verified; inline_result_match=true; copy_rehash_match=true",
+      "output": {
+        "path": ".smoke/recovered-owned/38631923-49db-4574-891d-9363742f7507/d5b2171a-be4b-4826-857c-b23457697aea.png",
+        "bytes": 940955,
+        "sha256": "b4905bbc23a311ce7bf95dffff7b278d83b2390ae4976abe1db9255fc1e4723d",
+        "independent_checks": "parent shasum -a 256 matches; sips: format png, 1254x1254"
+      }
+    },
+    {
+      "name": "register_dry_run",
+      "command": "npm run register (dry run)",
+      "result": "exit 3 inconclusive with both earlier probes; not registered. Parent subprocess capture of `claude mcp get codex-image-mcp`: returncode 1, stdout empty, stderr 281 chars starting with `No MCP server named \"codex-image-mcp\". Configured servers:`. The phase 12 probe expected it on stdout. Probe now accepts that prefix on exactly one non-empty stream (stderr or stdout); mixed output stays inconclusive. Final dry run pending parent readback."
+    }
+  ],
+  "limitations": [
+    "The repaired image convenience path has NOT been re-run live end to end: only one image was authorized and the original job remains failed. The image bytes were obtained via read-only recovery, not via a successful codex_image_generate.",
+    "The bridge never retries turns or generations. Codex backend/app-server internals may retry transport on their own; that is not claimed impossible.",
+    "Image editing is disabled and unverified.",
+    "Delegated prompts run as a general Codex agent with the normal config, plugins and auth; there is no image-only guarantee.",
+    "Registration (--apply) not executed."
+  ]
+}
