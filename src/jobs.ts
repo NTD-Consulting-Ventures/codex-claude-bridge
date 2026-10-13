@@ -1,5 +1,11 @@
 // Bounded async job manager: at most one active job, a bounded number of
 // retained finished jobs, a wall-clock limit per job, and no retries.
+//
+// The wall-clock deadline and manual cancellation both abort the job signal;
+// the first abort reason ("TIMEOUT" or "CANCELLED") is the root cause. A job
+// stays active (BUSY) until its runner promise settles and any owned partial
+// output has been removed: runners await their own filesystem work and never
+// abandon it.
 
 import { randomUUID } from "node:crypto";
 import { TaskError, type TaskDiagnostic, type TaskErrorCode, type TurnOutcome } from "./session.js";
@@ -24,9 +30,32 @@ interface Job {
   view: JobView;
   controller: AbortController;
   settled: Promise<void>;
+  /** Set once the runner has settled; later cancel requests are refused. */
+  runnerDone: boolean;
 }
 
-export type JobRunner = (signal: AbortSignal, timeoutMs: number, jobId: string) => Promise<TurnOutcome | unknown>;
+export type AbortCode = Extract<TaskErrorCode, "TIMEOUT" | "CANCELLED">;
+
+/** Root cause of an aborted job signal: "TIMEOUT" when the deadline fired first, else "CANCELLED". */
+export function abortCode(signal: AbortSignal): AbortCode {
+  return signal.reason === "TIMEOUT" ? "TIMEOUT" : "CANCELLED";
+}
+
+/** Throws the typed root-cause error if the job signal has been aborted. */
+export function throwIfAborted(signal: AbortSignal): void {
+  if (signal.aborted) throw new TaskError(abortCode(signal));
+}
+
+/**
+ * `own` registers cleanup of output the runner created; it is awaited (before
+ * the job is released) whenever the job does not end in success.
+ */
+export type JobRunner = (
+  signal: AbortSignal,
+  timeoutMs: number,
+  jobId: string,
+  own: (cleanup: () => Promise<void>) => void,
+) => Promise<TurnOutcome | unknown>;
 
 export class JobManager {
   private readonly jobs = new Map<string, Job>();
@@ -55,23 +84,46 @@ export class JobManager {
       result: null,
     };
     this.activeId = view.job_id;
-    let p: Promise<unknown>;
-    try {
-      p = Promise.resolve(runner(controller.signal, this.wallMs, view.job_id));
-    } catch (e) {
-      p = Promise.reject(e);
-    }
-    const settled = p.then(
-      (result) => this.finish(view, "succeeded", null, result),
-      (e: unknown) => {
-        const te = e instanceof TaskError ? e : new TaskError("PROTOCOL_ERROR");
-        const err: NonNullable<JobView["error"]> = { code: te.code };
-        if (te.requestKind !== undefined) err.request_kind = te.requestKind;
-        if (te.diagnostic !== undefined) err.diagnostic = { ...te.diagnostic };
-        this.finish(view, te.code === "CANCELLED" ? "cancelled" : "failed", err, null);
-      },
-    );
-    this.jobs.set(view.job_id, { view, controller, settled });
+    const cleanups: (() => Promise<void>)[] = [];
+    const own = (c: () => Promise<void>): void => void cleanups.push(c);
+    const deadline = setTimeout(() => controller.abort("TIMEOUT"), this.wallMs);
+    const job: Job = { view, controller, settled: Promise.resolve(), runnerDone: false };
+    this.jobs.set(view.job_id, job);
+    job.settled = (async () => {
+      let ok = false;
+      let result: unknown = null;
+      let error: unknown;
+      try {
+        result = await runner(controller.signal, this.wallMs, view.job_id, own);
+        ok = true;
+      } catch (e) {
+        error = e;
+      }
+      job.runnerDone = true;
+      clearTimeout(deadline);
+      // An abort observed before settlement (accepted cancel or deadline) wins.
+      if (controller.signal.aborted) {
+        const code = abortCode(controller.signal);
+        if (!(error instanceof TaskError && error.code === code)) error = new TaskError(code);
+        ok = false;
+      }
+      if (ok) {
+        this.finish(view, "succeeded", null, result);
+        return;
+      }
+      for (const c of cleanups) {
+        try {
+          await c();
+        } catch {
+          // Best effort; the owned path is never reported.
+        }
+      }
+      const te = error instanceof TaskError ? error : new TaskError("PROTOCOL_ERROR");
+      const err: NonNullable<JobView["error"]> = { code: te.code };
+      if (te.requestKind !== undefined) err.request_kind = te.requestKind;
+      if (te.diagnostic !== undefined) err.diagnostic = { ...te.diagnostic };
+      this.finish(view, te.code === "CANCELLED" ? "cancelled" : "failed", err, null);
+    })();
     return { ...view };
   }
 
@@ -84,7 +136,7 @@ export class JobManager {
     const id = this.activeId;
     const j = id !== undefined ? this.jobs.get(id) : undefined;
     if (!j) return true;
-    j.controller.abort();
+    j.controller.abort("CANCELLED");
     let timer: NodeJS.Timeout | undefined;
     const timedOut = new Promise<false>((r) => {
       timer = setTimeout(() => r(false), graceMs);
@@ -104,8 +156,8 @@ export class JobManager {
   /** Cancels a running job. Returns false if unknown or already finished. */
   cancel(id: string): boolean {
     const j = this.jobs.get(id);
-    if (!j || j.view.state !== "running") return false;
-    j.controller.abort();
+    if (!j || j.view.state !== "running" || j.runnerDone || j.controller.signal.aborted) return false;
+    j.controller.abort("CANCELLED");
     return true;
   }
 

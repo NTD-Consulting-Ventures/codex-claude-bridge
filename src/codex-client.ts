@@ -336,9 +336,11 @@ export class CodexRpcClient {
     return new Promise<unknown>((resolve, reject) => {
       const timeoutMs = opts.timeoutMs ?? this.limits.defaultTimeoutMs;
       const timer = setTimeout(() => {
-        // A request that times out leaves the peer in an unknown state: fail closed.
+        // A request that times out leaves the peer in an unknown state: fail
+        // closed, reporting "timeout" (not "closed") as the close reason so
+        // observers keep the root cause.
         this.settle(id, new CodexClientError("timeout"));
-        this.shutdown("closed", true);
+        this.shutdown("timeout", true);
       }, timeoutMs);
       let cleanupAbort = (): void => {};
       if (opts.signal) {

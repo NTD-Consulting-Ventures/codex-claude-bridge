@@ -199,6 +199,8 @@ export interface RunOptions {
   signal: AbortSignal;
   createTransport: (cwd: string) => CodexTransport;
   clientVersion: string;
+  /** Internal (tests only): per-RPC deadline; never exposed to MCP callers. */
+  rpcTimeoutMs?: number;
 }
 
 interface TurnDone {
@@ -346,12 +348,13 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
   if (pendingFailure) failWith?.(pendingFailure);
 
   const deadline = setTimeout(() => fail(new TaskError("TIMEOUT")), opts.timeoutMs);
-  const onAbort = (): void => fail(new TaskError("CANCELLED"));
+  // The job deadline aborts with reason "TIMEOUT"; anything else is a cancel.
+  const onAbort = (): void => fail(new TaskError(opts.signal.reason === "TIMEOUT" ? "TIMEOUT" : "CANCELLED"));
   opts.signal.addEventListener("abort", onAbort, { once: true });
   transport.onExit(() => fail(new TaskError("PROCESS_EXITED")));
 
   const rpc = (method: string, params: unknown): Promise<unknown> =>
-    Promise.race([client.request(method, params, { timeoutMs: RPC_TIMEOUT_MS }), failure]);
+    Promise.race([client.request(method, params, { timeoutMs: opts.rpcTimeoutMs ?? RPC_TIMEOUT_MS }), failure]);
 
   try {
     await rpc("initialize", initializeParams(opts.clientVersion));

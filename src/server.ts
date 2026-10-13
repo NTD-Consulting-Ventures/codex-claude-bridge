@@ -12,8 +12,8 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { pathToFileURL } from "node:url";
 import type { CodexTransport } from "./codex-client.js";
 import { CwdError, validateCwd } from "./cwd.js";
-import { buildImagePrompt, codexHome, collectImage, ImageError, outputRoot, type ImageFile, type ImageResult } from "./image-service.js";
-import { DEFAULT_WALL_MS, JobManager, MAX_WALL_MS } from "./jobs.js";
+import { buildImagePrompt, codexHome, collectImage, ImageError, outputRoot, type CollectHooks, type ImageFile, type ImageResult } from "./image-service.js";
+import { DEFAULT_WALL_MS, JobManager, MAX_WALL_MS, throwIfAborted } from "./jobs.js";
 import { resolveCodexBin, spawnAppServer, terminateAllAppServers } from "./process-transport.js";
 import { runDelegatedTurn, TaskError } from "./session.js";
 import { codexVersion, getStatus, SERVER_VERSION, type CapabilityProbe, type VersionProbe } from "./status.js";
@@ -51,7 +51,8 @@ export const TOOLS = {
       "Runs with native sandbox read-only and approvals on-request; any approval request fails the job with " +
       "APPROVAL_REQUIRED. One active job at a time. Returns a job_id; poll codex_task_status.",
     inputSchema: promptCwd,
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    // Conservative: delegated Codex runs with the user's normal config/plugins/MCP servers.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },
   codex_task_status: {
     name: "codex_task_status",
@@ -72,7 +73,8 @@ export const TOOLS = {
       "yields a verified PNG/JPEG, copied into a UUID subdirectory of CODEX_IMAGE_OUTPUT_ROOT. Succeeded result: " +
       "{job_id, files:[{path, mime_type, bytes, sha256}], codex_version}. May consume quota; never retried.",
     inputSchema: promptCwd,
-    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    // Conservative: writes files and the image prompt constraint is not enforced natively.
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },
 };
 
@@ -89,6 +91,8 @@ export interface ServerDeps {
   createTransport?: (cwd: string) => CodexTransport;
   wallMs?: number;
   env?: NodeJS.ProcessEnv;
+  /** Internal (tests only): awaited after each image output filesystem step has completed. */
+  imageAfterStep?: CollectHooks["afterStep"];
 }
 
 function ok(obj: Record<string, unknown>): ToolResult {
@@ -190,7 +194,7 @@ export class ToolHandler {
     }
     if (this.jobs.active !== undefined) return err("BUSY", "Another job is active.");
     const prompt = name === "codex_image_generate" ? buildImagePrompt(a.prompt) : a.prompt;
-    const view = this.jobs.start(name === "codex_image_generate" ? "image" : "task", async (signal, timeoutMs, jobId) => {
+    const view = this.jobs.start(name === "codex_image_generate" ? "image" : "task", async (signal, timeoutMs, jobId, own) => {
       const outcome = await runDelegatedTurn({
         prompt,
         cwd,
@@ -202,14 +206,22 @@ export class ToolHandler {
       if (name === "codex_task_start") {
         return { text: outcome.text, text_truncated: outcome.textTruncated, image_items: outcome.images.length };
       }
+      // Post-processing stays inside the job deadline/cancellation: every
+      // await completes (no abandoned writes), the signal is checked between
+      // awaits, and the owned output dir is removed by JobManager on failure.
+      const checkpoint = (): void => throwIfAborted(signal);
+      checkpoint();
       let files: ImageFile[];
       try {
-        files = await collectImage(outcome, root as string, [codexHome(this.env)]);
+        files = await collectImage(outcome, root as string, [codexHome(this.env)], { checkpoint, own, afterStep: this.deps.imageAfterStep });
       } catch (e) {
         if (e instanceof ImageError) throw new TaskError(e.code);
         throw e;
       }
-      const result: ImageResult = { job_id: jobId, files, codex_version: await codexVersion(this.deps.versionProbe) };
+      checkpoint();
+      const version = await codexVersion(this.deps.versionProbe);
+      checkpoint();
+      const result: ImageResult = { job_id: jobId, files, codex_version: version };
       return result;
     });
     if (!view) return err("BUSY", "Another job is active.");

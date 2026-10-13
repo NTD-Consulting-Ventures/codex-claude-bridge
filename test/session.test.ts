@@ -307,3 +307,48 @@ test("imageGeneration items are captured without reading them", async () => {
   const out = await runDelegatedTurn(opts(fake));
   assert.deepEqual(out.images, [{ savedPath: "/x/y.png", status: "completed" }]);
 });
+
+for (const [method, phase] of [
+  ["initialize", "initialize"],
+  ["model/list", "model_select"],
+  ["thread/start", "thread_start"],
+  ["turn/start", "turn_start"],
+] as const) {
+  test(`withheld ${method} response: RPC deadline yields TIMEOUT in phase ${phase}, no retry, transport terminated`, async () => {
+    const fake = new FakeAppServer({ onRequest: (msg) => (msg.method === method ? undefined : defaultReply(msg)) });
+    await assert.rejects(runDelegatedTurn(opts(fake, { rpcTimeoutMs: 20, timeoutMs: 5_000 })), (e: unknown) => {
+      assert.ok(e instanceof TaskError);
+      assert.equal(e.code, "TIMEOUT");
+      assert.deepEqual(e.diagnostic, { phase });
+      return true;
+    });
+    assert.equal(fake.methods().filter((m) => m === method).length, 1, "never retried");
+    assert.ok(!fake.methods().includes("turn/interrupt"));
+    assert.equal(fake.killed, true);
+  });
+}
+
+test("approval request during a withheld RPC keeps APPROVAL_REQUIRED as root cause", async () => {
+  const fake = new FakeAppServer({
+    onRequest(msg, ctx) {
+      if (msg.method === "thread/start") {
+        setTimeout(() => ctx.send({ id: 7, method: "item/commandExecution/requestApproval", params: {} }), 1);
+        return undefined;
+      }
+      return defaultReply(msg);
+    },
+  });
+  await rejectsWith(runDelegatedTurn(opts(fake, { rpcTimeoutMs: 50 })), "APPROVAL_REQUIRED", "command_execution");
+  assert.equal(fake.killed, true);
+});
+
+test("job signal aborted with reason TIMEOUT maps to TIMEOUT, other reasons to CANCELLED", async () => {
+  for (const [reason, code] of [["TIMEOUT", "TIMEOUT"], ["CANCELLED", "CANCELLED"]] as const) {
+    const fake = new FakeAppServer();
+    const ac = new AbortController();
+    const p = runDelegatedTurn(opts(fake, { signal: ac.signal }));
+    setTimeout(() => ac.abort(reason), 10);
+    await rejectsWith(p, code);
+    assert.equal(fake.killed, true);
+  }
+});

@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtempSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, promises as fsp, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -295,6 +295,252 @@ test("text-only completion is not image success; non-image or outside-home paths
     assert.equal((done.error as any).code, code);
   }
 });
+
+test("delegating tools are conservatively annotated destructive", () => {
+  assert.equal(TOOLS.codex_task_start.annotations.destructiveHint, true);
+  assert.equal(TOOLS.codex_image_generate.annotations.destructiveHint, true);
+  assert.equal(TOOLS.codex_task_start.annotations.readOnlyHint, false);
+  assert.equal(TOOLS.codex_image_generate.annotations.readOnlyHint, false);
+  assert.equal(TOOLS.codex_status.annotations.readOnlyHint, true);
+  assert.equal(TOOLS.codex_task_status.annotations.readOnlyHint, true);
+});
+
+// Deterministic gates. `afterStep` gates hold the job AFTER the output mkdir /
+// copy has already completed; the version-probe gate holds the probe itself in
+// flight. True in-flight filesystem gates (mocked fsp.mkdir and
+// FileHandle.writeFile) follow further below.
+interface Gate {
+  entered: Promise<void>;
+  release: () => void;
+  hold: () => Promise<void>;
+}
+function gate(): Gate {
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((r) => (enter = r));
+  const released = new Promise<void>((r) => (release = r));
+  return { entered, release, hold: async () => (enter(), await released) };
+}
+
+function imageFixture(deps: (g: Gate) => ServerDeps, wallMs = 60_000): { h: ToolHandler; g: Gate; out: string; base: string } {
+  const base = tmp();
+  const home = path.join(base, "codex-home");
+  mkdirSync(path.join(home, "generated_images"), { recursive: true });
+  const src = path.join(home, "generated_images", "img.png");
+  writeFileSync(src, PNG);
+  const out = path.join(base, "out");
+  const g = gate();
+  const h = handler({ wallMs, env: { CODEX_HOME: home, CODEX_IMAGE_OUTPUT_ROOT: out }, createTransport: () => imageScript(src), ...deps(g) });
+  return { h, g, out, base };
+}
+const afterStep = (step: "mkdir" | "copy") => (g: Gate): ServerDeps => ({ imageAfterStep: async (s) => (s === step ? g.hold() : undefined) });
+const atVersion = (g: Gate): ServerDeps => ({ versionProbe: async () => (await g.hold(), { ok: true, stdout: "codex-cli 0.156.0\n" }) });
+const ownedEntries = (out: string): string[] => {
+  try {
+    return readdirSync(out);
+  } catch {
+    return [];
+  }
+};
+
+for (const [label, deps] of [["after-mkdir gate", afterStep("mkdir")], ["after-copy gate", afterStep("copy")], ["in-flight version probe", atVersion]] as const) {
+  test(`cancel during ${label}: stays BUSY until in-flight work settles, then CANCELLED with owned output removed`, async () => {
+    const { h, g, out, base } = imageFixture(deps);
+    const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
+    await g.entered;
+    assert.equal(ownedEntries(out).length, 1, "owned dir exists while gated");
+    const c = (await h.call("codex_task_cancel", { job_id })).structuredContent as any;
+    assert.equal(c.cancel_requested, true);
+    assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, false, "second cancel is a no-op");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(h.jobs.active, job_id, "BUSY is not released while work is outstanding");
+    assert.equal(((await h.call("codex_task_start", { prompt: "x", cwd: base })).structuredContent as any).error.code, "BUSY");
+    g.release();
+    const done = await waitDone(h, job_id);
+    assert.equal(done.state, "cancelled");
+    assert.equal((done.error as any).code, "CANCELLED");
+    assert.equal(done.result, null);
+    assert.deepEqual(ownedEntries(out), [], "only the owned UUID dir existed and it was removed");
+    assert.equal(h.jobs.active, undefined);
+  });
+
+  test(`deadline during ${label}: TIMEOUT root cause wins over a later cancel; owned output removed`, async () => {
+    const { h, g, out, base } = imageFixture(deps, 150);
+    const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
+    await g.entered;
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(h.jobs.active, job_id, "still BUSY past the deadline while gated work is outstanding");
+    assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, false);
+    g.release();
+    const done = await waitDone(h, job_id);
+    assert.equal(done.state, "failed");
+    assert.equal((done.error as any).code, "TIMEOUT");
+    assert.deepEqual(ownedEntries(out), []);
+    assert.equal(h.jobs.active, undefined);
+  });
+}
+
+test("cancel before the deadline stays CANCELLED even when the deadline passes during gated work", async () => {
+  const { h, g, out, base } = imageFixture(atVersion, 150);
+  const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
+  await g.entered;
+  await h.call("codex_task_cancel", { job_id });
+  await new Promise((r) => setTimeout(r, 200));
+  g.release();
+  const done = await waitDone(h, job_id);
+  assert.equal((done.error as any).code, "CANCELLED");
+  assert.deepEqual(ownedEntries(out), []);
+});
+
+test("cancel after completion is refused and leaves the succeeded result and files intact", async () => {
+  const { h, g, out, base } = imageFixture(atVersion);
+  const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
+  await g.entered;
+  g.release();
+  const done = await waitDone(h, job_id);
+  assert.equal(done.state, "succeeded");
+  const c = (await h.call("codex_task_cancel", { job_id })).structuredContent as any;
+  assert.equal(c.cancel_requested, false);
+  assert.equal(c.state, "succeeded");
+  assert.equal((await waitDone(h, job_id)).state, "succeeded");
+  assert.equal(ownedEntries(out).length, 1);
+});
+
+test("version probe failure after collection still succeeds with null version (no output removed)", async () => {
+  const { h, out, base } = imageFixture(() => ({ versionProbe: async () => ({ ok: false, stdout: "" }) }));
+  const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
+  const done = await waitDone(h, job_id);
+  assert.equal(done.state, "succeeded");
+  assert.equal((done.result as any).codex_version, null);
+  assert.equal(ownedEntries(out).length, 1);
+});
+
+test("shutdown at the after-copy gate: grace expires without releasing BUSY; release then cancels and cleans up", async () => {
+  const { h, g, out, base } = imageFixture(afterStep("copy"));
+  const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
+  await g.entered;
+  let terminations = 0;
+  const shutdown = makeShutdown(h.jobs, async () => void terminations++, 30);
+  await shutdown();
+  assert.equal(terminations, 1);
+  assert.equal(h.jobs.active, job_id, "copy still in flight: job not released");
+  g.release();
+  const done = await waitDone(h, job_id);
+  assert.equal(done.state, "cancelled");
+  assert.deepEqual(ownedEntries(out), []);
+  assert.equal(h.jobs.active, undefined);
+});
+
+// True in-flight filesystem gates: the production ToolHandler runs unchanged
+// while a test mock holds the real fsp.mkdir(outputRoot) / destination
+// FileHandle.writeFile before the underlying call is made. Mocks are restored
+// by t.mock after each test; tests in this file run sequentially.
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+async function within<T>(p: Promise<T>, what: string, ms = 2_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<never>((_, rej) => {
+    timer = setTimeout(() => rej(new Error(`${what} not reached within ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([p, limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function inFlightFixture(wallMs: number): { h: ToolHandler; g: Gate; out: string; base: string; src: string } {
+  const f = imageFixture(() => ({}), wallMs);
+  mkdirSync(f.out);
+  writeFileSync(path.join(f.out, "sentinel.txt"), "keep");
+  return { ...f, src: path.join(f.base, "codex-home", "generated_images", "img.png") };
+}
+
+function assertIntact(out: string, src: string): void {
+  assert.deepEqual(ownedEntries(out), ["sentinel.txt"], "only the owned UUID dir was removed");
+  assert.equal(readFileSync(path.join(out, "sentinel.txt"), "utf8"), "keep", "unrelated output-root content intact");
+  assert.deepEqual(readFileSync(src), PNG, "source image intact");
+}
+
+for (const mode of ["deadline", "cancel"] as const) {
+  const code = mode === "deadline" ? "TIMEOUT" : "CANCELLED";
+
+  test(`in-flight fsp.mkdir(outputRoot) held (${mode}): BUSY until mkdir returns, then ${code}, never succeeded`, { timeout: 10_000 }, async (t) => {
+    const { h, g, out, base, src } = inFlightFixture(mode === "deadline" ? 50 : 60_000);
+    const realMkdir = fsp.mkdir;
+    t.mock.method(fsp, "mkdir", async (p: unknown, ...rest: unknown[]) => {
+      if (p === out) await g.hold();
+      return (realMkdir as (...a: unknown[]) => Promise<unknown>).call(fsp, p, ...rest);
+    });
+    const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
+    try {
+      await within(g.entered, "mkdir(outputRoot)");
+      if (mode === "cancel") assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, true);
+      await sleep(100);
+      assert.equal(h.jobs.active, job_id, "BUSY while mkdir is in flight");
+      assert.equal(h.jobs.get(job_id)?.state, "running");
+      assert.equal(((await h.call("codex_task_start", { prompt: "x", cwd: base })).structuredContent as any).error.code, "BUSY");
+      assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, false, "late cancel refused");
+      assert.deepEqual(ownedEntries(out), ["sentinel.txt"], "no owned dir created yet");
+    } finally {
+      g.release();
+    }
+    const done = await waitDone(h, job_id);
+    assert.equal(done.state, mode === "deadline" ? "failed" : "cancelled");
+    assert.equal((done.error as any).code, code);
+    assert.equal(done.result, null);
+    assertIntact(out, src);
+    assert.equal(h.jobs.active, undefined);
+  });
+
+  test(`in-flight destination writeFile held (${mode}): BUSY, write not abandoned, then ${code} with owned output removed`, { timeout: 10_000 }, async (t) => {
+    const { h, g, out, base, src } = inFlightFixture(mode === "deadline" ? 50 : 60_000);
+    const events: string[] = [];
+    let dest: string | undefined;
+    const realOpen = fsp.open;
+    const realRm = fsp.rm;
+    t.mock.method(fsp, "open", async (p: unknown, ...rest: unknown[]) => {
+      const fh = await (realOpen as (...a: unknown[]) => Promise<any>).call(fsp, p, ...rest);
+      if (typeof p === "string" && p.startsWith(out + path.sep)) {
+        dest = p;
+        const realWrite = fh.writeFile.bind(fh);
+        fh.writeFile = async (...a: unknown[]) => {
+          events.push("write-start");
+          await g.hold();
+          await realWrite(...a);
+          events.push("write-done");
+        };
+      }
+      return fh;
+    });
+    t.mock.method(fsp, "rm", async (...a: unknown[]) => {
+      events.push("rm");
+      return (realRm as (...x: unknown[]) => Promise<void>).call(fsp, ...a);
+    });
+    const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
+    try {
+      await within(g.entered, "destination writeFile");
+      if (mode === "cancel") assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, true);
+      await sleep(100);
+      assert.equal(h.jobs.active, job_id, "BUSY while the destination write is in flight");
+      assert.equal(((await h.call("codex_task_start", { prompt: "x", cwd: base })).structuredContent as any).error.code, "BUSY");
+      assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, false, "late cancel refused");
+      assert.deepEqual(events, ["write-start"], "no cleanup while the write is outstanding");
+      assert.ok(dest !== undefined && existsSync(dest), "destination exists while write is held");
+    } finally {
+      g.release();
+    }
+    const done = await waitDone(h, job_id);
+    assert.equal(done.state, mode === "deadline" ? "failed" : "cancelled");
+    assert.equal((done.error as any).code, code);
+    assert.equal(done.result, null);
+    assert.deepEqual(events.slice(0, 2), ["write-start", "write-done"], "write completed before any removal");
+    assert.ok(events.length > 2 && events.slice(2).every((e) => e === "rm"));
+    assert.equal(existsSync(dest as string), false);
+    assertIntact(out, src);
+    assert.equal(h.jobs.active, undefined);
+  });
+}
 
 test("shutdown cancels the active job, interrupts its turn, kills it, then terminates all app-servers once", async () => {
   const cwd = tmp();

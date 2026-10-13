@@ -149,8 +149,11 @@ test("no retries: failed request is sent exactly once", async () => {
 test("late response after timeout is ignored; timeout kills transport", async () => {
   const t = new FakeTransport();
   const c = new CodexRpcClient(t);
+  const closes: string[] = [];
+  c.onClose((k) => closes.push(k));
   const p = c.request("slow", undefined, { timeoutMs: 10 });
   await assert.rejects(p, isKind("timeout"));
+  assert.deepEqual(closes, ["timeout"], "close observer keeps the timeout root cause");
   assert.equal(t.killed, 1);
   assert.equal(c.isClosed, true);
   t.emit({ jsonrpc: "2.0", id: 1, result: "late" });
