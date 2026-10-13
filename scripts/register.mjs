@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Registers this server with Claude Code via the official CLI only:
-//   claude mcp add --transport stdio --scope user [-e CODEX_BIN=<abs>] [-e CODEX_IMAGE_OUTPUT_ROOT=<abs>] codex-image-mcp -- <node> <dist/src/server.js>
+//   claude mcp add --transport stdio --scope user codex-image-mcp [-e CODEX_BIN=<abs>] [-e CODEX_IMAGE_OUTPUT_ROOT=<abs>] -- <node> <dist/src/server.js>
 // It never reads or writes ~/.claude.json directly. It refuses to overwrite an
 // existing registration of the same name. Default is a dry run; pass --apply to
 // actually register.
