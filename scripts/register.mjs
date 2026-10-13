@@ -1,14 +1,15 @@
 #!/usr/bin/env node
-// Registers this server with Claude Code via the official CLI only:
-//   claude mcp add --transport stdio --scope user codex-image-mcp [-e CODEX_BIN=<abs>] [-e CODEX_IMAGE_OUTPUT_ROOT=<abs>] -- <node> <dist/src/server.js>
+// Registers codex-claude-bridge with Claude Code via the official CLI only:
+//   claude mcp add --transport stdio --scope user codex-image-mcp [-e CODEX_BIN=<abs>] -e CODEX_IMAGE_OUTPUT_ROOT=<abs> -- <node> <dist/src/server.js>
 // It never reads or writes ~/.claude.json directly. It refuses to overwrite an
 // existing registration of the same name. Default is a dry run; pass --apply to
 // actually register.
 //
 // Portable: CLAUDE_BIN (absolute) selects the claude CLI instead of PATH;
 // CODEX_BIN (absolute) is forwarded into the registration so the server uses
-// it instead of ~/.local/bin/codex; CODEX_IMAGE_OUTPUT_ROOT (absolute) is
-// forwarded to enable codex_image_generate. All fail closed when set but invalid.
+// it instead of ~/.local/bin/codex. The image output root is resolved by the
+// same resolver the server uses (unset → ~/codex-images) and always forwarded.
+// All fail closed when set but invalid.
 
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -45,6 +46,7 @@ if (!existsSync(codex.path)) {
 }
 
 const args = addArgs(node, serverJs, codex, outRoot.path);
+process.stdout.write(`Image output root (${outRoot.source}): ${outRoot.path}\n`);
 
 const probe = spawnSync(claude.path, ["mcp", "get", NAME], { encoding: "utf8", timeout: 30_000, maxBuffer: 256 * 1024 });
 switch (classifyProbe(probe)) {

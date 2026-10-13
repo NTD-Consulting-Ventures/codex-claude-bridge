@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { addArgs, classifyProbe, resolveClaudeBin, resolveRegisteredCodexBin, resolveRegisteredOutputRoot, SERVER_NAME } from "../src/install.js";
+import { addArgs, classifyProbe, EMPTY_CONFIG_NOT_FOUND, resolveClaudeBin, resolveRegisteredCodexBin, resolveRegisteredOutputRoot, SERVER_NAME } from "../src/install.js";
 
 test("CLAUDE_BIN / CODEX_BIN: absolute normalized paths accepted, anything else fails closed", () => {
   assert.deepEqual(resolveClaudeBin({}), { ok: true, path: "claude", source: "default" });
@@ -41,53 +41,113 @@ test("add argv: name precedes every -e (claude 2.1.293 -e is variadic), then -- 
   ]);
 });
 
-test("CODEX_IMAGE_OUTPUT_ROOT is forwarded only when set and absolute; invalid fails closed", () => {
-  assert.deepEqual(resolveRegisteredOutputRoot({}), { ok: true, path: null });
-  assert.deepEqual(resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: "/Users/u/img" }), { ok: true, path: "/Users/u/img" });
-  for (const bad of ["img", "./img", "/a/../img", "/a//img", "/", "/a\0b"]) {
-    assert.equal(resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: bad }).ok, false, bad);
+test("resolved output root (default or override) is forwarded consistently; invalid (incl. empty) fails closed", () => {
+  const head = ["mcp", "add", "--transport", "stdio", "--scope", "user", "codex-image-mcp"];
+  const codexEnv = { ok: true as const, path: "/c", source: "env" as const };
+  const def = resolveRegisteredOutputRoot({}, () => "/Users/u");
+  assert.deepEqual(def, { ok: true, path: "/Users/u/codex-images", source: "default" });
+  const ovr = resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: "/Users/u/img" });
+  assert.deepEqual(ovr, { ok: true, path: "/Users/u/img", source: "env" });
+  for (const r of [def, ovr]) {
+    assert.ok(r.ok);
+    // Name stays before every variadic -e.
+    assert.deepEqual(addArgs("/n", "/s.js", codexEnv, r.path), [...head, "-e", "CODEX_BIN=/c", "-e", `CODEX_IMAGE_OUTPUT_ROOT=${r.path}`, "--", "/n", "/s.js"]);
   }
-  assert.ok(!addArgs("/n", "/s.js", { ok: true, path: "/c", source: "default" }).some((x) => x.startsWith("CODEX_IMAGE_OUTPUT_ROOT=")));
+  for (const bad of ["", "img", "./img", "/a/../img", "/a//img", "/img/", "/", "/a\0b"]) {
+    assert.equal(resolveRegisteredOutputRoot({ CODEX_IMAGE_OUTPUT_ROOT: bad }).ok, false, JSON.stringify(bad));
+  }
 });
 
-test("conflict probe: only the exact claude 2.1.293 not-found answer allows registering", () => {
-  // Fixture of the actual installed-CLI shape; the real configured-server list is not stored.
-  const actualNotFound = `No MCP server named "${SERVER_NAME}". Configured servers: alpha, beta-tools, ${SERVER_NAME}-old\n`;
-  // Actual subprocess capture: exit 1, stdout empty, not-found line on stderr.
+test("empty-config probe: only the exact verified claude 2.1.293 form is absent", () => {
+  // Receipt: .harness-evidence/empty-config-probe.json (isolated CLAUDE_CONFIG_DIR).
+  const exact = 'No MCP server named "codex-image-mcp". Run `claude mcp add` to add one.\n';
+  assert.equal(EMPTY_CONFIG_NOT_FOUND, exact);
+  assert.equal(classifyProbe({ status: 1, signal: null, stdout: "", stderr: exact }), "absent");
+  const bad = [
+    { status: 1, signal: null, stdout: exact, stderr: "" },
+    { status: 1, signal: null, stdout: "x", stderr: exact },
+    { status: 1, signal: null, stdout: "", stderr: `warning\n${exact}` },
+    { status: 1, signal: null, stdout: "", stderr: `${exact}warning\n` },
+    { status: 1, signal: null, stdout: "", stderr: exact.trimEnd() },
+    { status: 1, signal: null, stdout: "", stderr: exact + "\n" },
+    { status: 1, signal: null, stdout: "", stderr: " " + exact },
+    { status: 1, signal: null, stdout: "", stderr: exact.replace("codex-image-mcp", "other") },
+    { status: 1, signal: null, stdout: "", stderr: exact.replace("Run", "run") },
+    { status: 2, signal: null, stdout: "", stderr: exact },
+    { status: null, signal: "SIGTERM", stdout: "", stderr: exact },
+    { status: 1, signal: null, error: { code: "ETIMEDOUT" }, stdout: "", stderr: exact },
+  ];
+  for (const p of bad) assert.equal(classifyProbe(p), "inconclusive", JSON.stringify(p).slice(0, 120));
+  assert.equal(classifyProbe({ status: 0, signal: null, stdout: "codex-image-mcp:\n  Scope: User config", stderr: "" }), "exists");
+});
+
+test("conflict probe: only the exact verified claude 2.1.293 configured-servers form allows registering", () => {
+  // Receipt: .harness-evidence/corrective-probe.json (isolated CLAUDE_CONFIG_DIR): exit 1,
+  // stdout empty, stderr exactly this single line.
+  const prefix = `No MCP server named "${SERVER_NAME}". Configured servers: `;
+  const actualNotFound = `${prefix}alpha, beta-tools, ${SERVER_NAME}-old\n`;
   assert.equal(classifyProbe({ status: 1, signal: null, stdout: "", stderr: actualNotFound }), "absent");
   assert.equal(classifyProbe({ status: 1, signal: null, stderr: actualNotFound }), "absent");
-  assert.equal(classifyProbe({ status: 1, signal: null, stdout: actualNotFound, stderr: "" }), "absent");
-  assert.equal(classifyProbe({ status: 1, signal: null, stdout: `No MCP server named "${SERVER_NAME}". Configured servers: \n` }), "absent");
+  assert.equal(classifyProbe({ status: 1, signal: null, stdout: "", stderr: `${prefix}alpha\n` }), "absent");
+  assert.equal(classifyProbe({ status: 1, signal: null, stdout: "", stderr: `${prefix}a_b, X9\n` }), "absent");
   // Exit 0 = exists in any scope (user, project, local); never overwritten.
   for (const scope of ["User", "Project", "Local"]) {
     assert.equal(classifyProbe({ status: 0, signal: null, stdout: `${SERVER_NAME}:\n  Scope: ${scope} config` }), "exists");
   }
   assert.equal(classifyProbe({ status: null, signal: null, error: { code: "ENOENT" } }), "cli_missing");
+  const err = (stderr: string, stdout = "") => ({ status: 1, signal: null, stdout, stderr });
   const inconclusive = [
     { status: null, signal: "SIGTERM" },
     { status: null, signal: null, error: { code: "ETIMEDOUT" } },
-    { status: 1, signal: null, stderr: "network error" },
+    err("network error"),
     // unverified older/other shapes
-    { status: 1, signal: null, stderr: `No MCP server found with name: "${SERVER_NAME}"` },
-    { status: 1, signal: null, stdout: `No MCP server found with name: "${SERVER_NAME}"` },
-    // other name, prefix not at start, wrong exit, noise on stderr, oversize
-    { status: 1, signal: null, stdout: 'No MCP server named "other-server". Configured servers: x' },
-    { status: 1, signal: null, stdout: `warning\n${actualNotFound}` },
-    { status: 1, signal: null, stdout: `No MCP server named "${SERVER_NAME}x". Configured servers: x` },
-    { status: 2, signal: null, stdout: actualNotFound },
-    { status: 1, signal: null, stdout: actualNotFound, stderr: "Error: config parse failed" },
-    // mixed: both streams non-empty, or nothing at all
-    { status: 1, signal: null, stdout: "warning", stderr: actualNotFound },
-    { status: 1, signal: null, stdout: actualNotFound, stderr: actualNotFound },
-    { status: 1, signal: null, stdout: "", stderr: "" },
-    { status: 1, signal: null, stderr: `warning\n${actualNotFound}` },
-    { status: 2, signal: null, stderr: actualNotFound },
-    { status: 1, signal: null, stdout: actualNotFound + "x".repeat(5000) },
-    { status: 1, signal: null, stderr: actualNotFound + "x".repeat(5000) },
-    { status: 1, signal: null, stderr: `No MCP server named "${SERVER_NAME}". Configured servers: alpha, ${SERVER_NAME}` },
-    // conflicting: claims not found but lists the exact name
-    { status: 1, signal: null, stdout: `No MCP server named "${SERVER_NAME}". Configured servers: alpha, ${SERVER_NAME}` },
-    { status: 1, signal: null, stdout: `No MCP server named "${SERVER_NAME}". Configured servers:\n  ${SERVER_NAME} (project)` },
+    err(`No MCP server found with name: "${SERVER_NAME}"`),
+    err("", `No MCP server found with name: "${SERVER_NAME}"`),
+    err(`No MCP server named "other-server". Configured servers: x\n`),
+    err(`No MCP server named "${SERVER_NAME}x". Configured servers: x\n`),
+    // stdout-only, or wrong exit
+    err("", actualNotFound),
+    { status: 2, signal: null, stdout: "", stderr: actualNotFound },
+    // mixed streams, including whitespace-only stdout
+    err(actualNotFound, "warning"),
+    err(actualNotFound, actualNotFound),
+    err(actualNotFound, " "),
+    err(actualNotFound, "\n"),
+    err("", ""),
+    err(" \n"),
+    // prepended/appended warnings, missing or extra newline, leading space, CRLF, oversize
+    err(`warning\n${actualNotFound}`),
+    err(`${actualNotFound}warning\n`),
+    err(`${actualNotFound}\n`),
+    err(actualNotFound.trimEnd()),
+    err(` ${actualNotFound}`),
+    err(actualNotFound.replace("\n", "\r\n")),
+    err(actualNotFound + "x".repeat(5000)),
+    // bare prefix and empty list
+    err(`No MCP server named "${SERVER_NAME}". Configured servers:\n`),
+    err(`No MCP server named "${SERVER_NAME}". Configured servers:`),
+    err(`${prefix}\n`),
+    err(`${prefix} \n`),
+    // contradictory: claims not found but lists the exact name
+    err(`${prefix}alpha, ${SERVER_NAME}\n`),
+    err(`${prefix}${SERVER_NAME}\n`),
+    err(`No MCP server named "${SERVER_NAME}". Configured servers:\n  ${SERVER_NAME} (project)\n`),
+    // duplicates and ambiguous / malformed entries, control characters
+    err(`${prefix}alpha, alpha\n`),
+    err(`${prefix}alpha,beta\n`),
+    err(`${prefix}alpha, \n`),
+    err(`${prefix}, alpha\n`),
+    err(`${prefix}alpha,  beta\n`),
+    err(`${prefix}alpha , beta\n`),
+    err(`${prefix}alpha, beta \n`),
+    err(`${prefix}alpha (project), beta\n`),
+    err(`${prefix}"alpha", beta\n`),
+    err(`${prefix}alpha\tbeta\n`),
+    err(`${prefix}alpha\u0000, beta\n`),
+    err(`${prefix}alpha\u001b[0m\n`),
+    err(`${prefix}-alpha\n`),
+    err(`${prefix}al.pha\n`),
+    err(`${prefix}${"a".repeat(65)}\n`),
   ];
-  for (const p of inconclusive) assert.equal(classifyProbe(p), "inconclusive", JSON.stringify(p).slice(0, 80));
+  for (const p of inconclusive) assert.equal(classifyProbe(p), "inconclusive", JSON.stringify(p).slice(0, 120));
 });

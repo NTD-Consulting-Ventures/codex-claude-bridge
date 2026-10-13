@@ -64,6 +64,8 @@ test("happy path: new thread, workspace-write bounded to cwd, on-request/user ap
   assert.deepEqual(fake.methods(), ["initialize", "initialized", "model/list", "thread/start", "turn/start"]);
   const init = fake.received[0]!;
   assert.deepEqual((init.params as { capabilities: unknown }).capabilities, { experimentalApi: false, requestAttestation: false });
+  // Stable client identity: name/ID unchanged, public title is the bridge, version passed through.
+  assert.deepEqual((init.params as { clientInfo: unknown }).clientInfo, { name: "codex-image-mcp", title: "codex-claude-bridge", version: "test" });
   assert.deepEqual(fake.received.find((m) => m.method === "model/list")!.params, {});
   const ts = fake.received.find((m) => m.method === "thread/start")!.params!;
   for (const k of ["config", "modelProvider", "allowProviderModelFallback", "baseInstructions", "developerInstructions", "dynamicTools", "permissions", "runtimeWorkspaceRoots"]) {

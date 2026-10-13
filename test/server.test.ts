@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { existsSync, mkdtempSync, mkdirSync, promises as fsp, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, promises as fsp, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -48,11 +48,44 @@ test("tool schemas are strict; no model/config/url/command parameters", () => {
   }
 });
 
-test("image tool is listed only when an output root is configured; no edit tool", () => {
-  assert.ok(!handler().listTools().some((t) => t.name === "codex_image_generate"));
-  const names = handler({ env: { CODEX_IMAGE_OUTPUT_ROOT: "/abs/out" } }).listTools().map((t) => t.name);
-  assert.ok(names.includes("codex_image_generate"));
-  assert.ok(!names.some((n) => n.includes("edit")));
+test("image tool is listed with no env (default root), with an override and with an invalid root; no edit tool", () => {
+  for (const env of [{}, { CODEX_IMAGE_OUTPUT_ROOT: "/abs/out" }, { CODEX_IMAGE_OUTPUT_ROOT: "" }]) {
+    const names = handler({ env }).listTools().map((t) => t.name);
+    assert.ok(names.includes("codex_image_generate"), JSON.stringify(env));
+    assert.ok(!names.some((n) => n.includes("edit")));
+  }
+});
+
+test("codex_status with no env reports the default root ~/codex-images as enabled", async () => {
+  const s = (await handler().call("codex_status", {})).structuredContent as Record<string, any>;
+  assert.equal(s.image_generate_enabled, true);
+  assert.deepEqual(s.image_output, { root: path.join(os.homedir(), "codex-images"), source: "default", error: null });
+  assert.equal(s.server_version, "0.2.0");
+  const o = (await handler({ env: { CODEX_IMAGE_OUTPUT_ROOT: "/abs/out" } }).call("codex_status", {})).structuredContent as Record<string, any>;
+  assert.deepEqual(o.image_output, { root: "/abs/out", source: "env", error: null });
+});
+
+test("invalid explicit root: status reports a sanitized error (not default/disabled success) and both tools fail before any job", async () => {
+  const cwd = tmp();
+  for (const [raw, reason] of [["", "empty"], ["rel/SECRET", "relative"], ["/a/../SECRET", "not_normalized"], ["/SECRET/", "not_normalized"], ["/", "filesystem_root"], ["/SECRET\0x", "nul_byte"]] as const) {
+    let spawned = 0;
+    const h = handler({ env: { CODEX_IMAGE_OUTPUT_ROOT: raw }, createTransport: () => (spawned++, new FakeAppServer(completingScript([turnCompleted()]))) });
+    const s = (await h.call("codex_status", {})).structuredContent as Record<string, any>;
+    assert.equal(s.image_generate_enabled, false, raw);
+    assert.equal(s.image_output.root, null);
+    assert.equal(s.image_output.source, "env");
+    assert.equal(s.image_output.error.code, "OUTPUT_ROOT_INVALID");
+    assert.equal(s.image_output.error.reason, reason, raw);
+    assert.ok(!JSON.stringify(s).includes("SECRET"));
+    for (const tool of ["codex_task_start", "codex_image_generate"]) {
+      const r = await h.call(tool, { prompt: "x", cwd });
+      assert.equal(r.isError, true);
+      assert.equal((r.structuredContent as any).error.code, "OUTPUT_ROOT_INVALID", `${tool} ${raw}`);
+      assert.ok(!JSON.stringify(r).includes("SECRET"));
+    }
+    assert.equal(h.jobs.active, undefined);
+    assert.equal(spawned, 0, "no job began");
+  }
 });
 
 test("wall limit defaults to 300s and is capped at 600s", () => {
@@ -177,7 +210,7 @@ test("task job lifecycle: start -> status -> succeeded with text", async () => {
   const { job_id } = r.structuredContent as { job_id: string };
   const done = await waitDone(h, job_id);
   assert.equal(done.state, "succeeded");
-  assert.deepEqual(done.result, { text: "done", text_truncated: false, image_items: 0 });
+  assert.deepEqual(done.result, { text: "done", text_truncated: false, image_items: 0, files: [] });
 });
 
 test("approval request yields failed job with APPROVAL_REQUIRED and only the request kind", async () => {
@@ -272,8 +305,6 @@ test("single active job; cancel; argument and cwd validation", async () => {
     assert.equal((r.structuredContent as any).error.code, "INVALID_CWD", bad);
   }
   assert.equal((await h.call("codex_task_status", { job_id: "00000000-0000-4000-8000-000000000000" })).isError, true);
-  const noRoot = await h.call("codex_image_generate", { prompt: "x", cwd });
-  assert.equal((noRoot.structuredContent as any).error.code, "OUTPUT_ROOT_NOT_CONFIGURED");
 });
 
 test("completed jobs are bounded", async () => {
@@ -334,7 +365,7 @@ test("text-only completion is not image success; non-image or outside-home paths
   writeFileSync(notImg, "not an image");
   const outside = path.join(base, "outside.png");
   writeFileSync(outside, PNG);
-  for (const [saved, code] of [[null, "NO_IMAGE_PRODUCED"], [notImg, "IMAGE_VERIFICATION_FAILED"], [outside, "IMAGE_VERIFICATION_FAILED"]] as const) {
+  for (const [saved, code] of [[null, "IMAGE_ITEM_INVALID"], [notImg, "IMAGE_VERIFICATION_FAILED"], [outside, "IMAGE_VERIFICATION_FAILED"]] as const) {
     const h = handler({ env: { CODEX_HOME: home, CODEX_IMAGE_OUTPUT_ROOT: path.join(base, "out") }, createTransport: () => imageScript(saved) });
     const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: base })).structuredContent as { job_id: string };
     const done = await waitDone(h, job_id);
@@ -647,9 +678,146 @@ test("MCP server lists tools over MCP", async () => {
   const client = new Client({ name: "test", version: "0" });
   await client.connect(ct);
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((t) => t.name), ["codex_status", "codex_task_start", "codex_task_status", "codex_task_cancel"]);
+  assert.deepEqual(tools.map((t) => t.name), ["codex_status", "codex_task_start", "codex_task_status", "codex_task_cancel", "codex_image_generate"]);
   const res = await client.callTool({ name: "codex_status", arguments: {} });
   assert.equal((res.structuredContent as any).codex_cli_version, "0.156.0");
   await client.close();
   await server.close();
+});
+
+// General codex_task_start: every native imageGeneration savedPath is saved.
+const JPEG = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(24, 2), Buffer.from([0xff, 0xd9])]);
+const sha = (b: Buffer): string => createHash("sha256").update(b).digest("hex");
+const imgItem = (id: string, savedPath: string | null, status = "completed"): object => ({
+  method: "item/completed",
+  params: { threadId: THREAD_ID, turnId: TURN_ID, item: { type: "imageGeneration", id, result: "", status, savedPath } },
+});
+
+function taskImageFixture(): { base: string; home: string; out: string; png: string; jpg: string } {
+  const base = tmp();
+  const home = path.join(base, "codex-home");
+  mkdirSync(path.join(home, "generated_images"), { recursive: true });
+  const png = path.join(home, "generated_images", "a.png");
+  const jpg = path.join(home, "generated_images", "b.jpg");
+  writeFileSync(png, PNG);
+  writeFileSync(jpg, JPEG);
+  return { base, home, out: path.join(base, "out"), png, jpg };
+}
+
+test("codex_task_start saves ALL native images (deduplicated) into one owned UUID dir and keeps text fields", async () => {
+  const f = taskImageFixture();
+  const frames = [agentMessage("made two"), imgItem("g1", f.png), imgItem("g2", f.jpg), imgItem("g3", f.png), turnCompleted()];
+  const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: f.out }, createTransport: () => new FakeAppServer(completingScript(frames)) });
+  const { job_id } = (await h.call("codex_task_start", { prompt: "draw", cwd: f.base })).structuredContent as { job_id: string };
+  const done = await waitDone(h, job_id);
+  assert.equal(done.state, "succeeded");
+  const r = done.result as any;
+  assert.deepEqual(Object.keys(r).sort(), ["files", "image_items", "text", "text_truncated"]);
+  assert.equal(r.text, "made two");
+  assert.equal(r.text_truncated, false);
+  assert.equal(r.image_items, 3);
+  assert.equal(r.files.length, 2);
+  assert.deepEqual(r.files.map((x: any) => [x.mime_type, x.bytes, x.sha256]), [["image/png", PNG.length, sha(PNG)], ["image/jpeg", JPEG.length, sha(JPEG)]]);
+  const dirs = readdirSync(f.out);
+  assert.equal(dirs.length, 1);
+  for (const x of r.files) {
+    assert.match(path.relative(f.out, x.path), /^[0-9a-f-]{36}\/[0-9a-f-]{36}\.(png|jpg)$/);
+    assert.equal(path.dirname(x.path), path.join(f.out, dirs[0]!));
+    assert.equal(sha(readFileSync(x.path)), x.sha256);
+  }
+});
+
+test("codex_task_start fails clearly on missing/unsupported/unverifiable/excess image items and leaves no output", async () => {
+  const f = taskImageFixture();
+  const notImg = path.join(f.home, "generated_images", "x.png");
+  writeFileSync(notImg, "not an image");
+  const outside = path.join(f.base, "outside.png");
+  writeFileSync(outside, PNG);
+  const cases: [string, object[], string][] = [
+    ["missing savedPath", [imgItem("g1", f.png), imgItem("g2", null)], "IMAGE_ITEM_INVALID"],
+    ["failed status", [imgItem("g1", f.png, "failed")], "IMAGE_ITEM_INVALID"],
+    ["not an image", [imgItem("g1", f.png), imgItem("g2", notImg)], "IMAGE_VERIFICATION_FAILED"],
+    ["outside codex home", [imgItem("g1", outside)], "IMAGE_VERIFICATION_FAILED"],
+    ["caller-style relative path", [imgItem("g1", "generated_images/a.png")], "IMAGE_VERIFICATION_FAILED"],
+    ["more items than the bound", Array.from({ length: 9 }, (_, i) => imgItem(`g${i}`, f.png)), "IMAGE_ITEM_INVALID"],
+  ];
+  for (const [label, items, code] of cases) {
+    const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: f.out }, createTransport: () => new FakeAppServer(completingScript([agentMessage("t"), ...items, turnCompleted()])) });
+    const { job_id } = (await h.call("codex_task_start", { prompt: "draw", cwd: f.base })).structuredContent as { job_id: string };
+    const done = await waitDone(h, job_id);
+    assert.equal(done.state, "failed", label);
+    assert.equal((done.error as any).code, code, label);
+    assert.equal(done.result, null, label);
+    assert.deepEqual(ownedEntries(f.out), [], label);
+  }
+  assert.deepEqual(readFileSync(f.png), PNG, "source intact");
+});
+
+test("codex_image_generate: a text-only completion is NO_IMAGE_PRODUCED", async () => {
+  const f = taskImageFixture();
+  const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: f.out }, createTransport: () => new FakeAppServer(completingScript([agentMessage("no"), turnCompleted()])) });
+  const { job_id } = (await h.call("codex_image_generate", { prompt: "a cat", cwd: f.base })).structuredContent as { job_id: string };
+  assert.equal(((await waitDone(h, job_id)).error as any).code, "NO_IMAGE_PRODUCED");
+  assert.deepEqual(ownedEntries(f.out), []);
+});
+
+test("symlinked output root (or ancestor) gets no writes: OUTPUT_ROOT_UNAVAILABLE", async () => {
+  const f = taskImageFixture();
+  const target = path.join(f.base, "target");
+  mkdirSync(target);
+  symlinkSync(target, path.join(f.base, "link"));
+  for (const root of [path.join(f.base, "link"), path.join(f.base, "link", "nested", "out")]) {
+    for (const tool of ["codex_task_start", "codex_image_generate"]) {
+      const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: root }, createTransport: () => new FakeAppServer(completingScript([imgItem("g", f.png), turnCompleted()])) });
+      const { job_id } = (await h.call(tool, { prompt: "draw", cwd: f.base })).structuredContent as { job_id: string };
+      const done = await waitDone(h, job_id);
+      assert.equal((done.error as any).code, "OUTPUT_ROOT_UNAVAILABLE", `${tool} ${root}`);
+      assert.deepEqual(readdirSync(target), [], "nothing written through the symlink");
+    }
+  }
+  // A regular file where the root should be is also refused.
+  writeFileSync(path.join(f.base, "file-root"), "x");
+  const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: path.join(f.base, "file-root") }, createTransport: () => new FakeAppServer(completingScript([imgItem("g", f.png), turnCompleted()])) });
+  const { job_id } = (await h.call("codex_task_start", { prompt: "draw", cwd: f.base })).structuredContent as { job_id: string };
+  assert.equal(((await waitDone(h, job_id)).error as any).code, "OUTPUT_ROOT_UNAVAILABLE");
+});
+
+for (const mode of ["cancel", "deadline"] as const) {
+  test(`codex_task_start image saving (${mode}) at the after-copy gate: BUSY until settled, owned output removed`, async () => {
+    const f = taskImageFixture();
+    const g = gate();
+    const h = handler({
+      wallMs: mode === "deadline" ? 150 : 60_000,
+      env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: f.out },
+      createTransport: () => new FakeAppServer(completingScript([imgItem("g1", f.png), imgItem("g2", f.jpg), turnCompleted()])),
+      imageAfterStep: async (s) => (s === "copy" ? g.hold() : undefined),
+    });
+    const { job_id } = (await h.call("codex_task_start", { prompt: "draw", cwd: f.base })).structuredContent as { job_id: string };
+    await g.entered;
+    assert.equal(ownedEntries(f.out).length, 1);
+    if (mode === "cancel") assert.equal(((await h.call("codex_task_cancel", { job_id })).structuredContent as any).cancel_requested, true);
+    else await new Promise((r) => setTimeout(r, 200));
+    assert.equal(h.jobs.active, job_id);
+    g.release();
+    const done = await waitDone(h, job_id);
+    assert.equal((done.error as any).code, mode === "cancel" ? "CANCELLED" : "TIMEOUT");
+    assert.equal(done.result, null);
+    assert.deepEqual(ownedEntries(f.out), []);
+    assert.equal(h.jobs.active, undefined);
+  });
+}
+
+test("launch policy regression: task with images still uses cwd-only workspace-write, on-request, no network, tmp excluded", async () => {
+  const f = taskImageFixture();
+  const fake = new FakeAppServer(completingScript([imgItem("g1", f.png), turnCompleted()]));
+  const h = handler({ env: { CODEX_HOME: f.home, CODEX_IMAGE_OUTPUT_ROOT: f.out }, createTransport: () => fake });
+  const { job_id } = (await h.call("codex_task_start", { prompt: "draw", cwd: f.base })).structuredContent as { job_id: string };
+  assert.equal((await waitDone(h, job_id)).state, "succeeded");
+  const ts = fake.received.find((m) => m.method === "thread/start")!.params!;
+  const tr = fake.received.find((m) => m.method === "turn/start")!.params!;
+  assert.deepEqual(Object.keys(ts).sort(), ["approvalPolicy", "approvalsReviewer", "cwd", "model", "sandbox"]);
+  assert.equal(ts.sandbox, "workspace-write");
+  assert.equal(tr.approvalPolicy, "on-request");
+  assert.deepEqual(tr.sandboxPolicy, { type: "workspaceWrite", writableRoots: [f.base], networkAccess: false, excludeSlashTmp: true, excludeTmpdirEnvVar: true });
+  assert.ok(!JSON.stringify(fake.received).includes(f.out), "output root never sent to Codex");
 });

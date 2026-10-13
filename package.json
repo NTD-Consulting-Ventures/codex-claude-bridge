@@ -1,14 +1,20 @@
 {
-  "name": "codex-image-mcp",
-  "version": "0.1.0",
+  "name": "codex-claude-bridge",
+  "version": "0.2.0",
   "private": true,
-  "description": "Trusted-local stdio MCP server that delegates tasks to the locally installed, logged-in Codex CLI (app-server). Not a security boundary.",
+  "description": "codex-claude-bridge: trusted-local stdio MCP server that lets Claude Code delegate tasks and native image generation to the locally installed, logged-in Codex CLI. Not a security boundary.",
   "license": "MIT",
+  "homepage": "https://github.com/NTD-Consulting-Ventures/codex-claude-bridge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NTD-Consulting-Ventures/codex-claude-bridge.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "bin": {
+    "codex-claude-bridge": "dist/src/server.js",
     "codex-image-mcp": "dist/src/server.js"
   },
   "scripts": {
