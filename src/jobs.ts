@@ -69,8 +69,11 @@ export class JobManager {
     return this.activeId;
   }
 
-  /** Returns null when a job is already active (single-active policy). */
-  start(kind: JobView["kind"], runner: JobRunner): JobView | null {
+  /**
+   * Returns null when a job is already active (single-active policy).
+   * `onSettle` receives the final state right before the job is released.
+   */
+  start(kind: JobView["kind"], runner: JobRunner, onSettle?: (state: Exclude<JobState, "running">) => void): JobView | null {
     if (this.activeId !== undefined) return null;
     this.prune();
     const controller = new AbortController();
@@ -107,7 +110,15 @@ export class JobManager {
         if (!(error instanceof TaskError && error.code === code)) error = new TaskError(code);
         ok = false;
       }
+      const settle = (state: Exclude<JobState, "running">): void => {
+        try {
+          onSettle?.(state);
+        } catch {
+          // Observer faults must not keep the job active.
+        }
+      };
       if (ok) {
+        settle("succeeded");
         this.finish(view, "succeeded", null, result);
         return;
       }
@@ -122,7 +133,9 @@ export class JobManager {
       const err: NonNullable<JobView["error"]> = { code: te.code };
       if (te.requestKind !== undefined) err.request_kind = te.requestKind;
       if (te.diagnostic !== undefined) err.diagnostic = { ...te.diagnostic };
-      this.finish(view, te.code === "CANCELLED" ? "cancelled" : "failed", err, null);
+      const state = te.code === "CANCELLED" ? "cancelled" : "failed";
+      settle(state);
+      this.finish(view, state, err, null);
     })();
     return { ...view };
   }

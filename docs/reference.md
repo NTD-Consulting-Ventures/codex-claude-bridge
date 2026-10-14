@@ -60,7 +60,7 @@
 | `codex_task_start` | `{prompt, cwd}` | `cwd`: absolute, normalized, existing directory, no symlinks, not `/`, `$HOME` or an ancestor. Returns `job_id`. Succeeded result: `{text, text_truncated, image_items, files: [{path, mime_type, bytes, sha256}]}`; `files` is `[]` when no image was produced. |
 | `codex_task_status` | `{job_id}` | `running` / `succeeded` / `failed` / `cancelled`, result or typed error. |
 | `codex_task_cancel` | `{job_id}` | Interrupts the turn and kills the process. |
-| `codex_image_generate` | `{prompt, cwd}` | Asks Codex for one native image. Succeeded result: `{job_id, files: [{path, mime_type, bytes, sha256}], codex_version}`. A text-only completion is `NO_IMAGE_PRODUCED`. No editing tool. |
+| `codex_image_generate` | `{prompt, cwd, session_handle?, fresh_session?}` | Asks Codex for one native image. Succeeded result: `{job_id, files: [{path, mime_type, bytes, sha256}], codex_version, session_handle, session}`. A text-only completion is `NO_IMAGE_PRODUCED`. Follow-up edits only via an explicit bridge-issued `session_handle`; see [image sessions](image-sessions.md). No input-image editing. |
 
 Limits: 300 s per job by default (`CODEX_TASK_WALL_SECONDS`, capped at 600), one active
 job, 20 retained finished jobs, 64 KiB result text, 8 MiB per JSON-RPC frame (an
@@ -75,7 +75,8 @@ Error codes: `APPROVAL_REQUIRED`, `UNSUPPORTED_SERVER_REQUEST`, `AUTH_REQUIRED`,
 `NO_IMAGE_PRODUCED`, `IMAGE_ITEM_INVALID`, `IMAGE_VERIFICATION_FAILED`,
 `OUTPUT_ROOT_INVALID`, `OUTPUT_ROOT_UNAVAILABLE`. Tool-call errors: `INVALID_ARGUMENTS`,
 `INVALID_CWD`, `BUSY`, `UNKNOWN_JOB`, `UNKNOWN_TOOL`, `TOOL_DISABLED` (a tool not
-exposed in the current `CODEX_BRIDGE_MODE`).
+exposed in the current `CODEX_BRIDGE_MODE`), `SHUTTING_DOWN` (the server is stopping;
+no job was started and no job ID exists).
 
 ## Bridge mode
 

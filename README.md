@@ -70,6 +70,7 @@ only; it was not run for this release.
 
 - [Setup details, discovery, updating, manual fallback and uninstall](docs/setup.md)
 - [Image-only mode: setup, existing entries and limits](docs/image-only.md)
+- [Image sessions: follow-up edits with an explicit `session_handle`](docs/image-sessions.md)
 - [Security model, tools and protocol](docs/reference.md)
 - [Troubleshooting](docs/troubleshooting.md)
 
