@@ -97,7 +97,10 @@ job errors raised before that job's turn starts. Any cancel, timeout, shutdown, 
 failure, output-verification failure or other uncertain error revokes the handle; such
 a job may have consumed quota or produced a native image before it failed. `BUSY` does
 not affect the handle. `codex_task_status` on an image job reports the job's own error
-code plus `session: {session_handle, usable, revoked_reason, next_action}`.
+code plus `session: {session_handle, usable, revoked_reason, rollover_reason, next_action}`.
+`rollover_reason` is `max_turns` or `max_prompt_chars` once a live, unrevoked session has
+used its whole turn or cumulative prompt budget; it is then `usable: false` with
+`revoked_reason: null` and `next_action: fresh_session_required`. Otherwise it is `null`.
 
 ## Capability discovery and fallback
 

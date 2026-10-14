@@ -199,11 +199,19 @@ export class ImageSessionStore {
     };
   }
 
-  /** Current usability of a handle, for job polling. */
-  state(handle: string): { usable: boolean; reason: RevokeReason | null } {
+  /**
+   * Current usability of a handle, for job polling. A live session whose turn or cumulative
+   * prompt budget is used up is not usable (its next continuation is SESSION_ROLLOVER_REQUIRED)
+   * but is not revoked: `rollover` names the exhausted limit.
+   */
+  state(handle: string): { usable: boolean; reason: RevokeReason | null; rollover: "max_turns" | "max_prompt_chars" | null } {
     this.prune();
     const s = this.sessions.get(handle);
-    if (s) return { usable: s.threadId !== null && !s.inUse, reason: null };
-    return { usable: false, reason: this.tombstones.get(handle) ?? "invalidated" };
+    if (s) {
+      const rollover =
+        s.turns >= SESSION_LIMITS.maxTurns ? "max_turns" : s.promptChars >= SESSION_LIMITS.maxPromptChars ? "max_prompt_chars" : null;
+      return { usable: s.threadId !== null && !s.inUse && rollover === null, reason: null, rollover };
+    }
+    return { usable: false, reason: this.tombstones.get(handle) ?? "invalidated", rollover: null };
   }
 }

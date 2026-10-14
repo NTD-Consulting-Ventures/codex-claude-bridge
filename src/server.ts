@@ -391,7 +391,7 @@ export class ToolHandler {
         if (handle === undefined) return ok({ ...v });
         const st = this.sessions.state(handle);
         const next = v.state === "running" ? "wait" : st.usable ? "reuse_only_for_related_edits" : "fresh_session_required";
-        return ok({ ...v, session: { session_handle: handle, usable: st.usable, revoked_reason: st.reason, next_action: next } });
+        return ok({ ...v, session: { session_handle: handle, usable: st.usable, revoked_reason: st.reason, rollover_reason: st.rollover, next_action: next } });
       }
       case "codex_task_cancel": {
         const a = exactKeys(args, ["job_id"]);

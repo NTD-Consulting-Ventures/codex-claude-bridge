@@ -374,26 +374,54 @@ test("idle expiry, max turns and cumulative prompt chars require an explicit fre
   const { w, deps } = world({ now: () => now });
   const m = await connect(deps);
   const h = (await m.gen({ prompt: "p", cwd: w.base })).start.session_handle;
-  for (let i = 1; i < SESSION_LIMITS.maxTurns; i++) assert.equal((await m.gen({ prompt: "edit", cwd: w.base, session_handle: h })).end.state, "succeeded");
+  const rollover = (handle: string, reason: string) => ({ session_handle: handle, usable: false, revoked_reason: null, rollover_reason: reason, next_action: "fresh_session_required" });
+  let last: Any = {};
+  for (let i = 1; i < SESSION_LIMITS.maxTurns; i++) {
+    last = (await m.gen({ prompt: "edit", cwd: w.base, session_handle: h })).end;
+    assert.equal(last.state, "succeeded");
+    if (i === SESSION_LIMITS.maxTurns - 2) assert.equal(last.session.usable, true);
+  }
+  // The poll at the exhausted turn budget already reports what the next call enforces.
+  assert.deepEqual(last.session, rollover(h, "max_turns"));
   const spawned = w.servers.length;
+  const turns = sent(w, "turn/start").length;
   const r = await m.call("codex_image_generate", { prompt: "one more", cwd: w.base, session_handle: h });
   assert.equal(r.error.code, "SESSION_ROLLOVER_REQUIRED");
   assert.equal(r.error.detail, "max_turns");
+  assert.equal(r.error.action, "fresh_session_required");
   assert.equal(w.servers.length, spawned);
+  assert.equal(sent(w, "turn/start").length, turns);
+  assert.deepEqual((await m.call("codex_task_status", { job_id: last.job_id })).session, rollover(h, "max_turns"));
+  const fresh = await m.gen({ prompt: "self-contained description", cwd: w.base, session_handle: h, fresh_session: true });
+  assert.equal(fresh.end.state, "succeeded");
+  assert.equal(fresh.end.result.session.continued, false);
+  assert.equal(fresh.end.session.usable, true);
+  assert.equal(fresh.end.session.rollover_reason, null);
 
   const big = "x".repeat(MAX_PROMPT_CHARS);
   const h2 = (await m.gen({ prompt: big, cwd: w.base })).start.session_handle;
-  for (let i = 1; i < SESSION_LIMITS.maxPromptChars / MAX_PROMPT_CHARS; i++) await m.gen({ prompt: big, cwd: w.base, session_handle: h2 });
+  let lastBig: Any = {};
+  for (let i = 1; i < SESSION_LIMITS.maxPromptChars / MAX_PROMPT_CHARS; i++) lastBig = (await m.gen({ prompt: big, cwd: w.base, session_handle: h2 })).end;
+  assert.equal(lastBig.result.session.prompt_chars_used, SESSION_LIMITS.maxPromptChars);
+  assert.ok(lastBig.result.session.turns_used < SESSION_LIMITS.maxTurns);
+  assert.deepEqual(lastBig.session, rollover(h2, "max_prompt_chars"));
   const spawned2 = w.servers.length;
+  const turns2 = sent(w, "turn/start").length;
   const c = await m.call("codex_image_generate", { prompt: "y", cwd: w.base, session_handle: h2 });
   assert.equal(c.error.code, "SESSION_ROLLOVER_REQUIRED");
   assert.equal(c.error.detail, "max_prompt_chars");
+  assert.equal(w.servers.length, spawned2);
+  assert.equal(sent(w, "turn/start").length, turns2);
+  const fresh2 = await m.gen({ prompt: "self-contained description", cwd: w.base, session_handle: h2, fresh_session: true });
+  assert.equal(fresh2.end.state, "succeeded");
+  assert.equal(fresh2.end.session.usable, true);
+  assert.equal(fresh2.end.session.rollover_reason, null);
 
   const h3 = (await m.gen({ prompt: "q", cwd: w.base })).start.session_handle;
   now += SESSION_LIMITS.idleTtlMs + 1;
   const e = await m.call("codex_image_generate", { prompt: "edit", cwd: w.base, session_handle: h3 });
   assert.equal(e.error.code, "SESSION_EXPIRED");
-  assert.equal(w.servers.length, spawned2 + 1);
+  assert.equal(w.servers.length, spawned2 + 2);
   // Recovery is explicit: the same handle with fresh_session starts a new thread.
   const f = await m.gen({ prompt: "self-contained description", cwd: w.base, session_handle: h3, fresh_session: true });
   assert.equal(f.end.state, "succeeded");
@@ -490,7 +518,7 @@ test("cancel, timeout and shutdown invalidate the handle; nothing is retried", a
     if (how === "shutdown") await makeShutdown(m.handler.jobs, async () => undefined, 2_000)();
     const end = await m.done(s.job_id);
     assert.equal(end.error.code, how === "timeout" ? "TIMEOUT" : "CANCELLED", how);
-    assert.deepEqual(end.session, { session_handle: h, usable: false, revoked_reason: "invalidated", next_action: "fresh_session_required" });
+    assert.deepEqual(end.session, { session_handle: h, usable: false, revoked_reason: "invalidated", rollover_reason: null, next_action: "fresh_session_required" });
     assert.equal(sent(w, "turn/start").length, 2, how);
     assert.ok(sent(w, "turn/interrupt").length >= 1, how);
     const again = await m.call("codex_image_generate", { prompt: "edit", cwd: w.base, session_handle: h });
