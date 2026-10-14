@@ -67,7 +67,9 @@ test("tool schemas are strict; no model/config/url/command parameters", () => {
   for (const t of Object.values(TOOLS)) {
     assert.equal(t.inputSchema.additionalProperties, false, t.name);
     const props = Object.keys(t.inputSchema.properties);
-    for (const p of props) assert.ok(["prompt", "cwd", "job_id"].includes(p), `${t.name}.${p}`);
+    // Only the image tool takes the bridge-issued session handle and the fresh flag.
+    const allowed = t.name === "codex_image_generate" ? ["prompt", "cwd", "session_handle", "fresh_session"] : ["prompt", "cwd", "job_id"];
+    for (const p of props) assert.ok(allowed.includes(p), `${t.name}.${p}`);
   }
 });
 
@@ -83,7 +85,7 @@ test("codex_status with no env reports the default root ~/codex-images as enable
   const s = (await handler().call("codex_status", {})).structuredContent as Record<string, any>;
   assert.equal(s.image_generate_enabled, true);
   assert.deepEqual(s.image_output, { root: path.join(os.homedir(), "codex-images"), source: "default", error: null });
-  assert.equal(s.server_version, "0.2.2");
+  assert.equal(s.server_version, "0.2.3");
   const o = (await handler({ env: { CODEX_IMAGE_OUTPUT_ROOT: "/abs/out" } }).call("codex_status", {})).structuredContent as Record<string, any>;
   assert.deepEqual(o.image_output, { root: "/abs/out", source: "env", error: null });
 });
@@ -368,7 +370,10 @@ test(`image job verifies native savedPath and copies into owned UUID subdir (${m
   const done = await waitDone(h, job_id);
   assert.equal(done.state, "succeeded");
   const r = done.result as any;
-  assert.deepEqual(Object.keys(r).sort(), ["codex_version", "files", "job_id"]);
+  // Injected fixture transports have no launcher schema to discover: continuity is reported unavailable.
+  assert.deepEqual(Object.keys(r).sort(), ["codex_version", "files", "job_id", "session", "session_handle"]);
+  assert.equal(r.session_handle, null);
+  assert.deepEqual(r.session, { continuity: "unavailable", reason: "injected_transport" });
   assert.equal(r.job_id, job_id);
   assert.equal(r.codex_version, "0.156.0");
   assert.equal(r.files.length, 1);
@@ -915,11 +920,11 @@ test("tool discovery: unset and general list the existing five definitions uncha
   assert.ok(Object.isFrozen(MODE_TOOLS) && Object.isFrozen(MODE_TOOLS.general) && Object.isFrozen(MODE_TOOLS["image-only"]));
 });
 
-test("codex_status reports bridge_mode and 0.2.2 in every mode; default and custom roots unchanged", async () => {
+test("codex_status reports bridge_mode and 0.2.3 in every mode; default and custom roots unchanged", async () => {
   for (const [env, mode] of [[{}, "general"], [{ CODEX_BRIDGE_MODE: "general" }, "general"], [IMAGE_ONLY, "image-only"]] as const) {
     const s = (await handler({ env }).call("codex_status", {})).structuredContent as Record<string, any>;
     assert.equal(s.bridge_mode, mode);
-    assert.equal(s.server_version, "0.2.2");
+    assert.equal(s.server_version, "0.2.3");
     assert.equal(s.active_job_id, null);
     assert.equal(s.launch.sandbox, "workspace-write");
     assert.equal(s.launch.approval_policy, "on-request");

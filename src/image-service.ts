@@ -6,8 +6,9 @@
 // native imageGeneration item whose savedPath is a regular PNG/JPEG file under
 // the normal Codex home. Any reported image item that is missing, unsupported
 // or unverifiable fails the job; none is silently dropped. Only native
-// savedPaths are read, never caller-supplied paths. Image editing is not
-// exposed (unverified).
+// savedPaths are read, never caller-supplied paths. Caller-supplied input
+// images are not accepted; edits are only follow-up turns on a bridge-owned
+// image thread (docs/image-sessions.md).
 //
 // TOCTOU caveat: the checks in paths.ts (O_NOFOLLOW, lstat/fstat comparison,
 // no symlink components, single link) narrow but cannot fully eliminate races
@@ -40,6 +41,7 @@ export function codexHome(env: NodeJS.ProcessEnv = process.env): string {
   return h && path.isAbsolute(h) ? path.normalize(h) : path.join(os.homedir(), ".codex");
 }
 
+/** Prompt-wrapper fallback, used only when the schema has no thread/start developerInstructions. */
 export function buildImagePrompt(prompt: string): string {
   return (
     "Generate exactly one image with your native image generation tool for the description below. " +
@@ -47,6 +49,20 @@ export function buildImagePrompt(prompt: string): string {
     prompt
   );
 }
+
+/**
+ * Native developer instructions of every bridge-owned image thread (sent on
+ * thread/start and reapplied on thread/resume), so the visible user message is
+ * the caller's own image request or edit.
+ */
+export const IMAGE_DEVELOPER_INSTRUCTIONS =
+  "This thread serves image requests relayed by codex-claude-bridge. For each user message, generate exactly one " +
+  "image with your native image generation tool. When a message asks for a change, apply it to the most recent " +
+  "image generated in this thread and keep everything else consistent. Do not run shell commands, edit files or " +
+  "call other tools.";
+
+/** Fixed native thread name (no user content). */
+export const IMAGE_THREAD_NAME = "codex-claude-bridge image session";
 
 export interface ImageFile {
   path: string;
@@ -60,6 +76,9 @@ export interface ImageResult {
   job_id: string;
   files: ImageFile[];
   codex_version: string | null;
+  /** Bridge-issued opaque handle for related edits (src/image-sessions.ts); null when continuity is unavailable. */
+  session_handle: string | null;
+  session: Record<string, unknown>;
 }
 
 /** Internal job hooks: cancellation, owned-output registration and a test-only after-step gate. */

@@ -118,6 +118,7 @@ export function defaultReply(msg: Msg): unknown {
     case "turn/start":
       return { result: { turn: { id: TURN_ID, items: [], status: "inProgress" } } };
     case "turn/interrupt":
+    case "thread/name/set":
       return { result: {} };
     default:
       return { error: { code: -32601, message: "method not found" } };

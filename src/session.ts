@@ -10,10 +10,16 @@
 // request (elevated approval, elicitation, auth refresh, dynamic tool, user
 // input) is denied and fails the job with a typed error; this bridge never
 // answers one on the user's behalf. No retries anywhere.
+//
+// Image threads (RunOptions.image, src/image-sessions.ts) may instead
+// thread/resume a thread this bridge itself started earlier, with the same
+// explicit policy, verified identity and reapplied developer instructions,
+// followed by a turn/start on that same thread id.
 
 import { CodexClientError, CodexRpcClient, type CodexTransport, type RpcErrorInfo } from "./codex-client.js";
 import { assertCwdShape } from "./cwd.js";
 import { selectDefaultModel, type ModelSelectionFailure } from "./model-select.js";
+import { THREAD_NAME_SET } from "./protocol-capabilities.js";
 import { classifyTurnMessage, httpStatusFromMessage, type TurnMessageClass } from "./turn-error.js";
 
 export const APPROVAL_POLICY = "on-request" as const;
@@ -40,8 +46,36 @@ export function initializeParams(clientVersion: string): Record<string, unknown>
  * app-server's own `model/list` advertises as default (src/model-select.ts).
  * Nothing else: no `config`, no writable-root or network overrides.
  */
-export function threadStartParams(cwd: string, model: string): Record<string, unknown> {
-  return { cwd: assertCwdShape(cwd), model, approvalPolicy: APPROVAL_POLICY, approvalsReviewer: APPROVALS_REVIEWER, sandbox: SANDBOX_MODE };
+export function threadStartParams(cwd: string, model: string, developerInstructions?: string): Record<string, unknown> {
+  const p: Record<string, unknown> = { cwd: assertCwdShape(cwd), model, approvalPolicy: APPROVAL_POLICY, approvalsReviewer: APPROVALS_REVIEWER, sandbox: SANDBOX_MODE };
+  if (developerInstructions !== undefined) p.developerInstructions = developerInstructions;
+  return p;
+}
+
+/**
+ * ThreadResumeParams for a bridge-owned thread: the same explicit cwd, model,
+ * approval policy, reviewer and sandbox as thread/start, the session's native
+ * developer instructions reapplied, and (when the schema has it) excludeTurns
+ * so no prior history is returned.
+ */
+export function threadResumeParams(
+  threadId: string,
+  cwd: string,
+  model: string,
+  developerInstructions: string,
+  excludeTurns: boolean,
+): Record<string, unknown> {
+  const p: Record<string, unknown> = {
+    threadId,
+    cwd: assertCwdShape(cwd),
+    model,
+    approvalPolicy: APPROVAL_POLICY,
+    approvalsReviewer: APPROVALS_REVIEWER,
+    sandbox: SANDBOX_MODE,
+    developerInstructions,
+  };
+  if (excludeTurns) p.excludeTurns = true;
+  return p;
 }
 
 /**
@@ -77,7 +111,8 @@ export type PolicyMismatch =
   | "approvals_reviewer"
   | "sandbox_type"
   | "network_access"
-  | "writable_roots";
+  | "writable_roots"
+  | "model";
 
 /**
  * Verifies the effective policy a ThreadStartResponse reports (codex-cli
@@ -113,7 +148,7 @@ export function threadPolicyMismatch(resp: unknown, cwd: string): PolicyMismatch
   return null;
 }
 
-export type Phase = "spawn" | "initialize" | "model_select" | "thread_start" | "turn_start" | "turn";
+export type Phase = "spawn" | "initialize" | "model_select" | "thread_start" | "thread_name" | "thread_resume" | "turn_start" | "turn";
 
 /** CodexErrorInfo variants (schema v0.156.0). Unknown variants map to "unrecognized". */
 const CODEX_ERROR_INFO = new Set([
@@ -153,6 +188,8 @@ export interface TaskDiagnostic {
   turn_message_class?: TurnMessageClass;
   http_status?: number;
   retried_errors?: number;
+  /** Which identity of a resumed bridge-owned thread did not match the session. */
+  session_mismatch?: "thread_id" | "model";
 }
 
 export interface TurnErrorSummary {
@@ -210,7 +247,10 @@ export type TaskErrorCode =
   | "IMAGE_ITEM_INVALID"
   | "IMAGE_VERIFICATION_FAILED"
   | "OUTPUT_ROOT_INVALID"
-  | "OUTPUT_ROOT_UNAVAILABLE";
+  | "OUTPUT_ROOT_UNAVAILABLE"
+  | "THREAD_RESUME_FAILED"
+  | "SESSION_STALE"
+  | "SESSION_INCOMPATIBLE";
 
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
@@ -279,7 +319,43 @@ export interface RunOptions {
   clientVersion: string;
   /** Internal (tests only): per-RPC deadline; never exposed to MCP callers. */
   rpcTimeoutMs?: number;
+  /** Bridge-owned image thread (codex_image_generate with native instructions). */
+  image?: ImageThreadOptions;
+  /**
+   * Strict event scoping, set for every codex_image_generate run (including the
+   * prompt-wrapper fallback without `image`): only events naming both the
+   * current thread and the current turn count, early ones are buffered. Task
+   * runs leave it unset and keep the original lenient matching.
+   */
+  strictImageEvents?: boolean;
 }
+
+export interface ImageThreadOptions {
+  /** Native developer instructions of the image thread (kept out of the visible user prompt). */
+  developerInstructions: string;
+  /** Fixed thread name, sent via thread/name/set on a new thread when the schema has it. */
+  threadName: string | null;
+  /** ThreadResumeParams.excludeTurns is in the schema. */
+  excludeTurns: boolean;
+  /** Continue this bridge-owned native thread (recorded after its own thread/start). */
+  resume?: { threadId: string; model: string };
+  /** Receives the verified native thread id and effective model before turn/start. */
+  onThread?: (threadId: string, model: string) => void;
+}
+
+/** Events kept per (thread, turn) until the current turn is known. */
+interface TurnAcc {
+  texts: Map<string, string>;
+  textBytes: number;
+  textTruncated: boolean;
+  images: ImageItem[];
+  imagesOverflow: boolean;
+  retriedErrors: number;
+  lastFatalError: TurnErrorSummary | undefined;
+}
+const MAX_BUFFERED_TURNS = 8;
+const newAcc = (): TurnAcc => ({ texts: new Map(), textBytes: 0, textTruncated: false, images: [], imagesOverflow: false, retriedErrors: 0, lastFatalError: undefined });
+const turnKey = (threadId: string, turnId: string): string => `${threadId}\n${turnId}`;
 
 interface TurnDone {
   status: string;
@@ -303,6 +379,8 @@ const RPC_FAILURE: Record<Exclude<Phase, "spawn" | "turn">, TaskErrorCode> = {
   initialize: "INITIALIZE_FAILED",
   model_select: "MODEL_UNAVAILABLE",
   thread_start: "THREAD_START_FAILED",
+  thread_name: "THREAD_START_FAILED",
+  thread_resume: "THREAD_RESUME_FAILED",
   turn_start: "TURN_START_FAILED",
 };
 
@@ -360,13 +438,15 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
   let threadId: string | undefined;
   let turnId: string | undefined;
   const completedTurns = new Map<string, TurnDone>();
-  const agentTexts = new Map<string, string>();
-  let textBytes = 0;
-  let textTruncated = false;
-  const images: ImageItem[] = [];
-  let imagesOverflow = false;
-  let retriedErrors = 0;
-  let lastFatalError: TurnErrorSummary | undefined;
+  // Image jobs are strict: an event counts only if it names both the
+  // current thread and the current turn. Events that arrive before the
+  // turn/start response are buffered per (thread, turn) and anything for a
+  // prior or unnamed turn is discarded; a resumed thread's history is never
+  // read. Task threads keep the original lenient matching.
+  const strict = opts.strictImageEvents === true;
+  const legacy = newAcc();
+  const buffered = new Map<string, TurnAcc>();
+  let bufferOverflow = false;
 
   let failWith: ((e: TaskError) => void) | undefined;
   let turnDoneResolve: ((d: TurnDone) => void) | undefined;
@@ -385,6 +465,27 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
 
   client.onClose((kind) => fail(fromClientError(new CodexClientError(kind), phase)));
 
+  /** Target accumulator of a turn-scoped event, or undefined when it must be ignored. */
+  const accFor = (p: Record<string, unknown>): TurnAcc | undefined => {
+    if (!strict) {
+      if (turnId !== undefined && typeof p.turnId === "string" && p.turnId !== turnId) return undefined;
+      return legacy;
+    }
+    if (typeof p.threadId !== "string" || typeof p.turnId !== "string") return undefined;
+    if ((threadId !== undefined && p.threadId !== threadId) || (turnId !== undefined && p.turnId !== turnId)) return undefined;
+    const key = turnKey(p.threadId, p.turnId);
+    let acc = buffered.get(key);
+    if (!acc) {
+      if (buffered.size >= MAX_BUFFERED_TURNS) {
+        bufferOverflow = true;
+        return undefined;
+      }
+      acc = newAcc();
+      buffered.set(key, acc);
+    }
+    return acc;
+  };
+
   client.onNotification((method, params) => {
     const p = obj(params);
     if (!p) return;
@@ -392,41 +493,46 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     if (method === "item/completed") {
       const item = obj(p.item);
       if (!item) return;
-      if (turnId !== undefined && typeof p.turnId === "string" && p.turnId !== turnId) return;
+      const acc = accFor(p);
+      if (!acc) return;
       if (item.type === "agentMessage" && typeof item.text === "string" && typeof item.id === "string") {
         const n = Buffer.byteLength(item.text, "utf8");
-        if (textBytes + n > MAX_RESULT_TEXT_BYTES) {
-          textTruncated = true;
+        if (acc.textBytes + n > MAX_RESULT_TEXT_BYTES) {
+          acc.textTruncated = true;
           return;
         }
-        textBytes += n;
-        agentTexts.set(item.id, item.text);
+        acc.textBytes += n;
+        acc.texts.set(item.id, item.text);
       } else if (item.type === "imageGeneration") {
-        if (images.length >= MAX_IMAGE_ITEMS) {
-          imagesOverflow = true;
+        if (acc.images.length >= MAX_IMAGE_ITEMS) {
+          acc.imagesOverflow = true;
           return;
         }
-        images.push({
+        acc.images.push({
           savedPath: typeof item.savedPath === "string" ? item.savedPath : null,
           status: typeof item.status === "string" ? item.status.slice(0, 64) : "unknown",
         });
       }
     } else if (method === "error") {
       // ErrorNotification { error: TurnError, willRetry, threadId, turnId }: only enums are kept.
-      if (turnId !== undefined && typeof p.turnId === "string" && p.turnId !== turnId) return;
-      if (p.willRetry === true) retriedErrors = Math.min(retriedErrors + 1, 1000);
-      else lastFatalError = summarizeTurnError(p.error);
+      const acc = accFor(p);
+      if (!acc) return;
+      if (p.willRetry === true) acc.retriedErrors = Math.min(acc.retriedErrors + 1, 1000);
+      else acc.lastFatalError = summarizeTurnError(p.error);
     } else if (method === "turn/completed") {
       const turn = obj(p.turn);
       if (!turn || typeof turn.id !== "string") return;
+      if (strict && typeof p.threadId !== "string") return;
       const err = obj(turn.error);
       const done: TurnDone = {
         status: typeof turn.status === "string" ? turn.status : "unknown",
         error: err ? summarizeTurnError(err) : undefined,
       };
-      // Completion may race ahead of the turn/start response: buffer by id.
-      if (completedTurns.size < 16) completedTurns.set(turn.id, done);
-      if (turnId === turn.id) turnDoneResolve?.(done);
+      // Completion may race ahead of the turn/start response: buffer by id
+      // (by thread and id for image threads).
+      const key = strict ? turnKey(p.threadId as string, turn.id) : turn.id;
+      if (completedTurns.size < 16) completedTurns.set(key, done);
+      if (turnId === turn.id && (!strict || p.threadId === threadId)) turnDoneResolve?.(done);
     }
   });
 
@@ -451,14 +557,55 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     phase = "model_select";
     const sel = await selectDefaultModel(rpc);
     if (!sel.ok) throw new TaskError("MODEL_UNAVAILABLE", undefined, { phase, model_selection: sel.reason });
-    phase = "thread_start";
-    const ts = obj(await rpc("thread/start", threadStartParams(opts.cwd, sel.model)));
-    const thread = obj(ts?.thread);
-    if (!thread || typeof thread.id !== "string") throw new TaskError("PROTOCOL_ERROR");
-    // Fail closed before any turn: the effective policy must be the bounded one.
-    const mismatch = threadPolicyMismatch(ts, opts.cwd);
-    if (mismatch !== null) throw new TaskError("POLICY_MISMATCH", undefined, { phase, policy_mismatch: mismatch });
-    threadId = thread.id;
+    const image = opts.image;
+    if (image?.resume) {
+      // Continuation of a bridge-owned thread: the advertised default must
+      // still be the session's model, and the resumed thread must report the
+      // same id, model and bounded policy before any turn.
+      const resume = image.resume;
+      if (sel.model !== resume.model) throw new TaskError("SESSION_INCOMPATIBLE", undefined, { phase, session_mismatch: "model" });
+      phase = "thread_resume";
+      threadId = resume.threadId;
+      let rs: Record<string, unknown> | undefined;
+      try {
+        rs = obj(await rpc("thread/resume", threadResumeParams(resume.threadId, opts.cwd, resume.model, image.developerInstructions, image.excludeTurns)));
+      } catch (e) {
+        const cls = e instanceof CodexClientError ? e.rpc?.message_class : undefined;
+        if (cls === "thread_not_found" || cls === "invalid_thread_id") {
+          const t = fromClientError(e, phase);
+          throw new TaskError("SESSION_STALE", undefined, t.diagnostic);
+        }
+        throw e;
+      }
+      const thread = obj(rs?.thread);
+      if (!thread || typeof thread.id !== "string") throw new TaskError("PROTOCOL_ERROR");
+      if (thread.id !== resume.threadId) throw new TaskError("SESSION_STALE", undefined, { phase, session_mismatch: "thread_id" });
+      const mismatch = threadPolicyMismatch(rs, opts.cwd);
+      if (mismatch !== null) throw new TaskError("POLICY_MISMATCH", undefined, { phase, policy_mismatch: mismatch });
+      if (rs?.model !== resume.model) throw new TaskError("SESSION_INCOMPATIBLE", undefined, { phase, session_mismatch: "model" });
+    } else {
+      phase = "thread_start";
+      const ts = obj(await rpc("thread/start", threadStartParams(opts.cwd, sel.model, image?.developerInstructions)));
+      const thread = obj(ts?.thread);
+      if (!thread || typeof thread.id !== "string") throw new TaskError("PROTOCOL_ERROR");
+      // Fail closed before any turn: the effective policy must be the bounded one.
+      const mismatch = threadPolicyMismatch(ts, opts.cwd);
+      if (mismatch !== null) throw new TaskError("POLICY_MISMATCH", undefined, { phase, policy_mismatch: mismatch });
+      // An image thread may later be resumed with this model: it must be the one requested.
+      if (image && ts?.model !== sel.model) throw new TaskError("POLICY_MISMATCH", undefined, { phase, policy_mismatch: "model" });
+      threadId = thread.id;
+      if (image?.threadName) {
+        phase = "thread_name";
+        try {
+          await rpc(THREAD_NAME_SET, { threadId, name: image.threadName });
+        } catch (e) {
+          // Only a peer that does not implement the optional method is skipped;
+          // transport, policy and other errors fail the job.
+          if (!(e instanceof CodexClientError && e.kind === "server_error" && e.rpc?.rpc_class === "method_not_found")) throw e;
+        }
+      }
+    }
+    image?.onThread?.(threadId, sel.model);
     phase = "turn_start";
     const turnDone = new Promise<TurnDone>((resolve) => {
       turnDoneResolve = resolve;
@@ -468,23 +615,26 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     if (!turn || typeof turn.id !== "string") throw new TaskError("PROTOCOL_ERROR");
     turnId = turn.id;
     phase = "turn";
-    const early = completedTurns.get(turnId);
+    const early = completedTurns.get(strict ? turnKey(threadId, turnId) : turnId);
     if (early) turnDoneResolve?.(early);
 
     const done = await Promise.race([turnDone, failure]);
     if (pendingFailure) throw pendingFailure;
+    // Strict: only the current (thread, turn) buffer; a dropped buffer may have been ours.
+    if (strict && bufferOverflow && !buffered.has(turnKey(threadId, turnId))) throw new TaskError("OUTPUT_LIMIT");
+    const acc = strict ? (buffered.get(turnKey(threadId, turnId)) ?? newAcc()) : legacy;
     if (done.status === "failed") {
-      const s = done.error ?? lastFatalError;
+      const s = done.error ?? acc.lastFatalError;
       const d: TaskDiagnostic = { phase: "turn" };
       if (s?.info) d.codex_error_info = s.info;
       if (s) d.turn_message_class = s.messageClass;
       if (s?.httpStatus) d.http_status = s.httpStatus;
-      if (retriedErrors > 0) d.retried_errors = retriedErrors;
+      if (acc.retriedErrors > 0) d.retried_errors = acc.retriedErrors;
       throw new TaskError(turnErrorCode(s), undefined, d);
     }
     if (done.status === "interrupted") throw new TaskError("TURN_INTERRUPTED");
     if (done.status !== "completed") throw new TaskError("PROTOCOL_ERROR");
-    return { text: [...agentTexts.values()].join("\n\n"), textTruncated, images, imagesOverflow };
+    return { text: [...acc.texts.values()].join("\n\n"), textTruncated: acc.textTruncated, images: acc.images, imagesOverflow: acc.imagesOverflow };
   } catch (e) {
     const err = pendingFailure ?? fromClientError(e, phase);
     // Best-effort interrupt of an in-flight turn, then terminate the process.
