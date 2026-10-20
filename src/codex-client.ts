@@ -497,6 +497,11 @@ export class CodexRpcClient {
       // Denied with an error unless a handler answers it above; no result is ever
       // fabricated. The observer only learns the method name so the caller can fail the job.
       this.stats.deniedServerRequests++;
+      if (h && h.methods.has(method)) {
+        // A handled method beyond the bound (or a duplicate id) is only denied; the job goes on.
+        this.writeSafe({ jsonrpc: "2.0", id: m.id, error: { code: DENIED_CODE, message: DENIED_MESSAGE } });
+        return;
+      }
       this.writeSafe({ jsonrpc: "2.0", id: m.id, error: { code: DENIED_CODE, message: DENIED_MESSAGE } });
       try {
         this.serverRequestObserver?.(m.method as string);

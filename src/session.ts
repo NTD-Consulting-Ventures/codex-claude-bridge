@@ -619,9 +619,17 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
       lastEventAt = now;
       if (firstModelEventMs === null && isModelEvent(method, obj(p.item))) firstModelEventMs = now - turnStartedAt;
     }
-    if ((method === "item/started" || method === "item/updated") && obj(p.item)?.type === "fileChange") {
-      const item = obj(p.item)!;
-      if (typeof item.id === "string" && (fileChanges.size < 64 || fileChanges.has(item.id))) fileChanges.set(item.id, fileChangesOf(item));
+    const fileItem =
+      (method === "item/started" || method === "item/updated") && obj(p.item)?.type === "fileChange"
+        ? obj(p.item)!
+        : method === "item/fileChange/patchUpdated"
+          ? { id: p.itemId, changes: p.changes }
+          : undefined;
+    if (fileItem && typeof fileItem.id === "string") {
+      // Newest announcement wins; the oldest items are forgotten beyond the bound.
+      fileChanges.delete(fileItem.id);
+      fileChanges.set(fileItem.id, fileChangesOf(fileItem));
+      while (fileChanges.size > 64) fileChanges.delete(fileChanges.keys().next().value!);
     }
     if (method === "item/completed") {
       const item = obj(p.item);

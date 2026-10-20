@@ -77,7 +77,7 @@ test("tool schemas are strict; no model/config/url/command parameters", () => {
           : t.name === "codex_task_wait"
             ? ["job_id", "max_wait_s"]
             : t.name === "codex_task_approve"
-              ? ["job_id", "approval_id", "decision"]
+              ? ["job_id", "approval_id", "decision", "request_summary"]
               : ["job_id"];
     for (const p of props) assert.ok(allowed.includes(p), `${t.name}.${p}`);
   }

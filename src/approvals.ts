@@ -69,7 +69,13 @@ export function resolveRegisteredApprovalMode(env: NodeJS.ProcessEnv): Registere
   return isApprovalMode(raw) ? { ok: true, persist: raw } : { ok: false, reason: APPROVAL_MODE_INVALID_MESSAGE };
 }
 
-export type DecidedBy = "claude_code_dialog" | "codex_task_approve" | "bypass" | "timeout" | "cancelled";
+/**
+ * Who or what decided: the user (dialog or tool), bypass mode, the timeout, a
+ * job cancel, the end of the run (the request was still open when the turn
+ * ended), or "not_displayable" (ask mode declines a request whose relevant
+ * parts could not all be shown).
+ */
+export type DecidedBy = "claude_code_dialog" | "codex_task_approve" | "bypass" | "timeout" | "cancelled" | "run_ended" | "not_displayable";
 
 /** One approval request and what became of it (shown in codex_task_status). */
 export interface ApprovalRecord {
@@ -113,7 +119,7 @@ export function describeApproval(r: ApprovalRequest, jobId: string): string {
     if (r.permissions.network) lines.push("  network access");
     for (const w of r.permissions.write) lines.push(`  write ${w}`);
     for (const x of r.permissions.read) lines.push(`  read ${x}`);
-    if (r.permissions.other_entries > 0) lines.push(`  ${r.permissions.other_entries} further sandbox entries`);
+    for (const e of r.permissions.entries) lines.push(`  ${e.access} ${e.target}${e.target === "special:root" ? " (the whole filesystem)" : ""}`);
   }
   if (r.network_host) lines.push(`Network: ${r.network_host}`);
   if (r.cwd) lines.push(`Directory: ${r.cwd}`);
@@ -130,14 +136,20 @@ export function describeApproval(r: ApprovalRequest, jobId: string): string {
 export class ApprovalBroker {
   private readonly pending = new Map<string, Pending[]>();
   private readonly records = new Map<string, ApprovalRecord[]>();
+  /** Jobs where a request went unanswered: nobody is answering, later requests are declined at once. */
+  private readonly unanswered = new Set<string>();
 
   constructor(
     private readonly jobs: JobManager,
     private readonly timeoutMs: number = APPROVAL_TIMEOUT_MS,
   ) {}
 
-  /** The decision function for one job run in ask or bypass mode. */
-  forJob(jobId: string, mode: "ask" | "bypass", signal: AbortSignal): (request: ApprovalRequest) => Promise<ApprovalDecision> {
+  /**
+   * The decision function for one job run in ask or bypass mode. `signal` is
+   * the job's (cancel / deadline); `runEnded` aborts when the run is over, so
+   * nothing stays pending for a turn that can no longer use the answer.
+   */
+  forJob(jobId: string, mode: "ask" | "bypass", signal: AbortSignal, runEnded?: AbortSignal): (request: ApprovalRequest) => Promise<ApprovalDecision> {
     return (request) => {
       const now = Date.now();
       const record: ApprovalRecord = {
@@ -161,13 +173,19 @@ export class ApprovalBroker {
       };
       if (mode === "bypass") return Promise.resolve(settle("accept", "bypass"));
       if (signal.aborted) return Promise.resolve(settle("decline", "cancelled"));
+      if (runEnded?.aborted) return Promise.resolve(settle("decline", "run_ended"));
+      if (!request.complete) return Promise.resolve(settle("decline", "not_displayable"));
+      if (this.unanswered.has(jobId)) return Promise.resolve(settle("decline", "timeout"));
       return new Promise<ApprovalDecision>((resolve) => {
         const onAbort = (): void => finish("decline", "cancelled");
+        const onRunEnded = (): void => finish("decline", "run_ended");
         const entry: Pending = { record, finish: (d, by) => finish(d, by), dialog: undefined };
         const finish = (decision: ApprovalDecision, by: DecidedBy): void => {
           if (record.decision !== null) return;
           clearTimeout(timer);
           signal.removeEventListener("abort", onAbort);
+          runEnded?.removeEventListener("abort", onRunEnded);
+          if (by === "timeout") this.unanswered.add(jobId);
           entry.dialog?.abort();
           const rest = (this.pending.get(jobId) ?? []).filter((p) => p !== entry);
           if (rest.length > 0) this.pending.set(jobId, rest);
@@ -179,7 +197,10 @@ export class ApprovalBroker {
         this.pending.set(jobId, [...(this.pending.get(jobId) ?? []), entry]);
         this.jobs.pauseDeadline(jobId);
         const timer = setTimeout(() => finish("decline", "timeout"), Math.max(0, Date.parse(record.expires_at!) - Date.now()));
+        // The open stdio connection keeps the server alive; this timer alone must not (shutdown, library use).
+        timer.unref();
         signal.addEventListener("abort", onAbort, { once: true });
+        runEnded?.addEventListener("abort", onRunEnded, { once: true });
         this.jobs.wake(jobId);
       });
     };
@@ -213,10 +234,14 @@ export class ApprovalBroker {
     );
   }
 
-  /** Answers a pending approval of a job. */
-  decide(jobId: string, approvalId: string, decision: ApprovalDecision): "decided" | "not_pending" {
+  /**
+   * Answers a pending approval of a job. `summary` must be the request's
+   * summary exactly, so the confirmation the user sees names what is decided.
+   */
+  decide(jobId: string, approvalId: string, decision: ApprovalDecision, summary: string): "decided" | "not_pending" | "summary_mismatch" {
     const p = (this.pending.get(jobId) ?? []).find((x) => x.record.approval_id === approvalId);
     if (!p) return "not_pending";
+    if (p.record.request.summary !== summary) return "summary_mismatch";
     p.finish(decision, "codex_task_approve");
     return "decided";
   }
@@ -233,6 +258,10 @@ export class ApprovalBroker {
 
   /** Drops records of jobs no longer retained. */
   forget(keep: (jobId: string) => boolean): void {
-    for (const id of [...this.records.keys()]) if (!keep(id) && !this.pending.has(id)) this.records.delete(id);
+    for (const id of [...this.records.keys()]) {
+      if (keep(id) || this.pending.has(id)) continue;
+      this.records.delete(id);
+      this.unanswered.delete(id);
+    }
   }
 }
