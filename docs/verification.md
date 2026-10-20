@@ -1,6 +1,39 @@
 # Verification status and evidence
 
-## This release (0.2.1, portable installer)
+## Release 0.3.0 (image-series resilience)
+
+- Automated checks on the final tree: lint, typecheck, build, `git diff --check`, and 296
+  of 308 fixture tests pass (10 skipped as before). The 2 that fail in the maintainers'
+  Linux container fail identically on the unchanged 0.2.3 tree there: they assert that a
+  killed schema-generator helper is gone, and that container's PID 1 leaves killed
+  orphans as zombies. CI runs the suite on macOS.
+- New fixture coverage (`test/image-series.test.ts`): per-job `timeout_s`, the bounded
+  queue, `codex_task_wait`, incremental saving (`files_so_far`), `partial_files` after
+  timeout, `TURN_FAILED` and cancel, thread-folder salvage (complete files only, older
+  files ignored, nothing during shutdown), reference-image validation and `localImage`
+  turn input, `aspect`, file metadata, error hints, the bounded and cached
+  `codex_status`, and the installer's timeout persistence.
+- **Schema check** with the official codex-cli 0.162.1 npm package: the generated stable
+  schema yields continuity available and `localImage` turn input available.
+- **Signed-out protocol check** with the same 0.162.1 package in a Linux container with
+  no OpenAI access (isolated `HOME`/`CODEX_HOME`, no sign-in, no credentials), driven
+  through the built server over MCP stdio: `codex_status` answered in about 0.1–0.2 s;
+  `codex_image_generate` with one reference image, `aspect: "1:1"` and `timeout_s: 20`
+  passed the thread policy check, `turn/start` with the `localImage` input was accepted
+  and echoed in the user message item, Codex then retried "Reconnecting… waiting for
+  network" (`responseStreamDisconnected`) and the job ended `TIMEOUT` with
+  `likely_cause: "network"`, `retried_errors: 5` and `first_model_event_ms: null`. No
+  image was generated and no quota was used.
+- **Field observation** that motivated this release (reported by the user, not
+  maintainer-verified): 0.2.3 with Codex 0.162.1 on macOS, about 220 image jobs over two
+  days from two parallel Claude sessions, 9 failures (8 `TIMEOUT`, 1 `TURN_FAILED` with
+  `turn_message_class: "network"`), mostly at the 300 s default with 2–3 images per job
+  and during drops of a mobile hotspot; several already generated images had to be
+  recovered from `~/.codex/generated_images` by hand.
+- Not covered: live image generation with 0.3.0, whether the model actually uses
+  reference images, and live salvage of real image events. These need a signed-in run.
+
+## Release 0.2.1 (portable installer)
 
 - Automated checks on the final tree: all 214 fixture tests, lint, typecheck, build and
   `git diff --check` pass. Installer tests run `scripts/register.mjs` end to end against
