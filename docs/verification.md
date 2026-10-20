@@ -28,8 +28,7 @@
 - Claude Code behaviour taken from its documentation: MCP elicitation since 2.1.76, and
   `anthropic/requiresUserInteraction` forcing a confirmation on every call of a tool.
   Whether Claude Code shows elicitation dialogs from a server outside a tool call is not
-  documented, so the bridge only opens them during `codex_task_wait` /
-  `codex_task_status`.
+  documented, so the bridge only opens them during `codex_task_wait`.
 - Not covered: a live approval with a signed-in Codex (it needs a model turn that asks for
   one), and the dialog in Claude Desktop or the VS Code extension.
 
