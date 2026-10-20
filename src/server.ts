@@ -1,18 +1,23 @@
 #!/usr/bin/env node
 // Trusted-local Codex delegation MCP server (stdio).
 //
-// Tools: codex_status, codex_task_start, codex_task_status, codex_task_cancel
-// and codex_image_generate. Native images are copied into the output root
+// Tools: codex_status, codex_task_start, codex_task_status, codex_task_wait,
+// codex_task_cancel and codex_image_generate. Native images are copied into the output root
 // resolved once by src/output-root.ts (default ~/codex-images); an invalid
 // explicit CODEX_IMAGE_OUTPUT_ROOT makes job starts fail with
 // OUTPUT_ROOT_INVALID before any job begins. The output root is written by
 // this process only; it is never added to Codex's writable roots.
 // Inputs are strictly validated; the only free-form value forwarded to Codex
 // is the delegated prompt. No model/config/URL/shell parameters exist.
+// Optional job arguments: timeout_s (bounded), queue (opt-in FIFO instead of
+// BUSY) and reference_images (PNG/JPEG paths inside cwd, verified here and
+// sent to Codex only as native localImage input when the installed schema
+// lists it, src/reference-images.ts). Images are saved incrementally and kept
+// as partial_files when a job fails (src/image-service.ts ImageSink).
 //
 // CODEX_BRIDGE_MODE (src/bridge-mode.ts) is resolved once per ToolHandler.
-// "image-only" lists only codex_status, codex_image_generate, codex_task_status
-// and codex_task_cancel; codex_task_start is refused with TOOL_DISABLED before
+// "image-only" lists only codex_status, codex_image_generate, codex_task_status,
+// codex_task_wait and codex_task_cancel; codex_task_start is refused with TOOL_DISABLED before
 // any validation, and jobs of kind "task" are reported as UNKNOWN_JOB. This
 // narrows the MCP tool surface only; the Codex launch policy is unchanged.
 //
@@ -31,12 +36,17 @@ import { requireBridgeMode, resolveBridgeMode, type BridgeMode } from "./bridge-
 import type { CodexTransport } from "./codex-client.js";
 import { CwdError, validateCwd } from "./cwd.js";
 import {
+  ASPECTS,
   buildImagePrompt,
   codexHome,
-  collectImage,
   IMAGE_DEVELOPER_INSTRUCTIONS,
   IMAGE_THREAD_NAME,
   ImageError,
+  ImageSink,
+  isAspect,
+  MAX_SAVED_IMAGES,
+  nativeSavedPaths,
+  withAspect,
   type CollectHooks,
   type ImageFile,
   type ImageResult,
@@ -50,35 +60,99 @@ import {
   type SessionContext,
   type SessionReject,
 } from "./image-sessions.js";
-import { DEFAULT_WALL_MS, JobManager, MAX_WALL_MS, throwIfAborted, type JobView } from "./jobs.js";
+import { JobManager, MAX_COMPLETED_JOBS, MAX_QUEUED_JOBS, throwIfAborted, type JobProgress, type JobView } from "./jobs.js";
+import { isJobTimeout, MAX_JOB_TIMEOUT_S, MIN_JOB_TIMEOUT_S, resolveJobTimeout, type JobTimeoutResolution } from "./limits.js";
 import { resolveOutputRoot, type OutputRootResolution } from "./output-root.js";
 import { resolveCodexBin, spawnAppServer, terminateAllAppServers } from "./process-transport.js";
 import { discoverImageCapabilities, unavailable, type ImageProtocolCapabilities } from "./protocol-capabilities.js";
-import { APPROVAL_POLICY, APPROVALS_REVIEWER, runDelegatedTurn, SANDBOX_MODE, TaskError, type ImageThreadOptions, type TurnOutcome } from "./session.js";
-import { codexVersion, getStatus, SERVER_VERSION, versionProbeFor, type CapabilityProbe, type VersionProbe } from "./status.js";
+import {
+  isReferenceList,
+  MAX_REFERENCE_IMAGE_BYTES,
+  MAX_REFERENCE_IMAGES,
+  MAX_REFERENCE_TOTAL_BYTES,
+  ReferenceImageError,
+  validateReferenceImages,
+} from "./reference-images.js";
+import {
+  APPROVAL_POLICY,
+  APPROVALS_REVIEWER,
+  runDelegatedTurn,
+  SANDBOX_MODE,
+  TaskError,
+  type ImageThreadOptions,
+  type RunOptions,
+  type TurnOutcome,
+  type TurnRunState,
+} from "./session.js";
+import {
+  codexVersion,
+  getStatus,
+  SERVER_VERSION,
+  versionProbeFor,
+  type CapabilityProbe,
+  type Listing,
+  type McpServerSummary,
+  type PluginSummary,
+  type VersionProbe,
+} from "./status.js";
+
+interface CachedListing<T> {
+  at: string;
+  listing: Listing<T>;
+}
 import { launcherStatus } from "./launch.js";
 
 export const MAX_PROMPT_CHARS = 32_000;
+export const DEFAULT_WAIT_S = 30;
+export const MAX_WAIT_S = 120;
 
 const noArgs = { type: "object" as const, properties: {}, additionalProperties: false };
+const promptCwdProps = {
+  prompt: { type: "string", minLength: 1, maxLength: MAX_PROMPT_CHARS },
+  cwd: {
+    type: "string",
+    minLength: 1,
+    maxLength: 4096,
+    description: "Absolute canonical existing directory (no symlinks, not / or home or its ancestors). The only writable root.",
+  },
+};
+/** Options shared by both job-starting tools. */
+const jobOptionProps = {
+  timeout_s: {
+    type: "integer",
+    minimum: MIN_JOB_TIMEOUT_S,
+    maximum: MAX_JOB_TIMEOUT_S,
+    description:
+      `Optional wall-clock limit for this job in seconds (${MIN_JOB_TIMEOUT_S}..${MAX_JOB_TIMEOUT_S}); default from ` +
+      "codex_status limits.job_timeout_s. Allow roughly 120-240 s per image you expect.",
+  },
+  queue: {
+    type: "boolean",
+    description:
+      "Optional. true queues the job behind a running one (state queued, FIFO) instead of failing with BUSY. " +
+      "Not combinable with session_handle.",
+  },
+  reference_images: {
+    type: "array",
+    minItems: 1,
+    maxItems: MAX_REFERENCE_IMAGES,
+    items: { type: "string", minLength: 1, maxLength: 4096 },
+    description:
+      `Optional reference images (1..${MAX_REFERENCE_IMAGES}): PNG/JPEG paths relative to cwd (or absolute inside it), ` +
+      "no symlinks, each <= 20 MiB, total <= 64 MiB. Sent to Codex as native image input (character sheets, props, " +
+      "an earlier version to edit). Combine many references into a few labelled boards.",
+  },
+};
 const promptCwd = {
   type: "object" as const,
-  properties: {
-    prompt: { type: "string", minLength: 1, maxLength: MAX_PROMPT_CHARS },
-    cwd: {
-      type: "string",
-      minLength: 1,
-      maxLength: 4096,
-      description: "Absolute canonical existing directory (no symlinks, not / or home or its ancestors). The only writable root.",
-    },
-  },
+  properties: { ...promptCwdProps, ...jobOptionProps },
   required: ["prompt", "cwd"],
   additionalProperties: false,
 };
 const imageInput = {
   type: "object" as const,
   properties: {
-    ...promptCwd.properties,
+    ...promptCwdProps,
     session_handle: {
       type: "string",
       pattern: SESSION_HANDLE_PATTERN,
@@ -92,6 +166,12 @@ const imageInput = {
         "Optional. true starts a new image thread (revoking the given session_handle, if any). A handle this server " +
         "process never issued is still rejected (SESSION_UNKNOWN); omit it instead.",
     },
+    aspect: {
+      type: "string",
+      enum: Object.keys(ASPECTS),
+      description: "Optional output aspect ratio, added to the prompt as a fixed phrase. Check width/height of the result.",
+    },
+    ...jobOptionProps,
   },
   required: ["prompt", "cwd"],
   additionalProperties: false,
@@ -102,11 +182,27 @@ const jobId = {
   required: ["job_id"],
   additionalProperties: false,
 };
+const waitInput = {
+  type: "object" as const,
+  properties: {
+    job_id: { type: "string", pattern: "^[0-9a-f-]{36}$" },
+    max_wait_s: { type: "integer", minimum: 1, maximum: MAX_WAIT_S, description: `Optional, default ${DEFAULT_WAIT_S}.` },
+  },
+  required: ["job_id"],
+  additionalProperties: false,
+};
+
+const SAVING =
+  "Images are saved as soon as Codex reports them (progress.files_so_far while running). If the job fails, times " +
+  "out or is cancelled, every image already generated is still verified and saved and listed in partial_files: check " +
+  "partial_files before retrying. error.retryable and error.likely_cause are hints; nothing is retried automatically.";
 
 export const TOOLS = {
   codex_status: {
     name: "codex_status",
-    description: "Codex CLI version, launch policy and a safe summary of installed plugin / MCP server names.",
+    description:
+      "Codex CLI version, launch policy, limits (job timeout, queue), the last finished job, and a safe summary of " +
+      "installed plugin / MCP server names. Bounded: answers within about 12 s even without network.",
     inputSchema: noArgs,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -117,22 +213,36 @@ export const TOOLS = {
       "Runs with native sandbox workspace-write bounded to cwd (only writable root; no network; /tmp and $TMPDIR " +
       "excluded) and approvals on-request: Codex may create and modify files inside cwd without approval. Any " +
       "elevated approval request (outside-root write, network, escalation) fails the job with APPROVAL_REQUIRED. " +
-      "One active job at a time. Returns a job_id; poll codex_task_status. Succeeded result: {text, text_truncated, " +
-      "image_items, files:[{path, mime_type, bytes, sha256}]}; files holds every verified native generated image " +
-      "copied into the image output root (empty when none). An unverifiable image item fails the job.",
+      "One running job at a time (queue: true to queue). Returns a job_id; use codex_task_wait (or poll " +
+      "codex_task_status). Succeeded result: {text, text_truncated, image_items, files:[{path, mime_type, bytes, " +
+      "sha256, index, width, height, has_alpha}]}; files holds every verified native generated image copied into the " +
+      "image output root (empty when none). An unverifiable image item fails the job. " +
+      SAVING,
     inputSchema: promptCwd,
     // Conservative: delegated Codex runs with the user's normal config/plugins/MCP servers.
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   },
   codex_task_status: {
     name: "codex_task_status",
-    description: "Get state and (when finished) result or typed error of a job. Result text is Codex output and may contain sensitive data.",
+    description:
+      "Get state (queued / running / succeeded / failed / cancelled), progress while running, and (when finished) " +
+      "result or typed error plus partial_files of a job. Result text is Codex output and may contain sensitive data.",
     inputSchema: jobId,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  codex_task_wait: {
+    name: "codex_task_wait",
+    description:
+      `Wait up to max_wait_s (default ${DEFAULT_WAIT_S}, max ${MAX_WAIT_S}) for a job to finish, then return the same ` +
+      "view as codex_task_status plus waited_ms. Call it again while state is running or queued; it replaces polling.",
+    inputSchema: waitInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   codex_task_cancel: {
     name: "codex_task_cancel",
-    description: "Cancel a running job: interrupts the turn and terminates the Codex process. Not retried.",
+    description:
+      "Cancel a queued or running job: interrupts the turn and terminates the Codex process. Not retried. Images " +
+      "already generated are still saved (partial_files).",
     inputSchema: jobId,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -142,8 +252,10 @@ export const TOOLS = {
       "Start a job asking Codex to generate one image natively. Success only if a native imageGeneration item " +
       "yields a verified PNG/JPEG, copied into a UUID subdirectory of the image output root (default ~/codex-images; " +
       "see codex_status image_output). Succeeded result: " +
-      "{job_id, files:[{path, mime_type, bytes, sha256}], codex_version, session_handle, session}. Same cwd-bounded " +
-      "workspace-write policy as codex_task_start. May consume quota; never retried. " +
+      "{job_id, files:[{path, mime_type, bytes, sha256, index, width, height, has_alpha}], codex_version, " +
+      "session_handle, session}. Same cwd-bounded workspace-write policy as codex_task_start. May consume quota; never " +
+      "retried. reference_images (paths in cwd) are sent as native image input for consistent characters or edits " +
+      "of a given picture; aspect adds a fixed format phrase. " +
       "Sessions: when supported, start and result return an opaque session_handle. To refine THAT image, call again " +
       "with the same session_handle, the same cwd, and only the requested change as prompt; the same native Codex " +
       "thread continues. For an unrelated image, omit session_handle. Never reuse a handle across unrelated requests " +
@@ -151,9 +263,10 @@ export const TOOLS = {
       "or 128000 prompt chars, and are revoked by any failure, cancel or timeout. A handle is a bearer capability for " +
       "this server process and cwd, not tied to a Claude conversation: never share it across conversations. A SESSION_* " +
       "error returned by this call rejects THIS request before any new turn; an earlier failed, cancelled or timed-out " +
-      "job of the session may still have consumed quota or produced a native image. Never retry automatically; starting " +
-      "over with fresh_session: true and a self-contained description is the user's explicit choice. Image job status " +
-      "includes session.next_action.",
+      "job of the session may still have produced an image: look at its partial_files, and to continue from it start " +
+      "with fresh_session: true and that file in reference_images (the user's explicit choice). Image job status " +
+      "includes session.next_action. " +
+      SAVING,
     inputSchema: imageInput,
     // Conservative: writes files and the image prompt constraint is not enforced natively.
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -164,8 +277,8 @@ type ToolName = keyof typeof TOOLS;
 
 /** Tools listed (and callable) per bridge mode, in listing order. */
 export const MODE_TOOLS: Readonly<Record<BridgeMode, readonly ToolName[]>> = Object.freeze({
-  general: Object.freeze(["codex_status", "codex_task_start", "codex_task_status", "codex_task_cancel", "codex_image_generate"] as const),
-  "image-only": Object.freeze(["codex_status", "codex_image_generate", "codex_task_status", "codex_task_cancel"] as const),
+  general: Object.freeze(["codex_status", "codex_task_start", "codex_task_status", "codex_task_wait", "codex_task_cancel", "codex_image_generate"] as const),
+  "image-only": Object.freeze(["codex_status", "codex_image_generate", "codex_task_status", "codex_task_wait", "codex_task_cancel"] as const),
 });
 
 function isToolName(name: string): name is ToolName {
@@ -264,12 +377,47 @@ function exactKeys(args: unknown, keys: string[]): Record<string, unknown> | nul
   return a;
 }
 
+/** Default job wall limit in ms from CODEX_TASK_WALL_SECONDS (src/limits.ts; invalid falls back, too high is capped). */
 export function wallFromEnv(env: NodeJS.ProcessEnv): number {
-  const raw = env.CODEX_TASK_WALL_SECONDS;
-  if (raw === undefined) return DEFAULT_WALL_MS;
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n <= 0) return DEFAULT_WALL_MS;
-  return Math.min(n * 1000, MAX_WALL_MS);
+  return resolveJobTimeout(env).seconds * 1000;
+}
+
+/** Arguments shared by both job-starting tools, validated before any job exists. */
+interface JobOptions {
+  timeoutMs: number | undefined;
+  queue: boolean;
+  references: string[] | undefined;
+}
+
+function jobOptions(a: Record<string, unknown>): JobOptions | null {
+  if (a.timeout_s !== undefined && !isJobTimeout(a.timeout_s)) return null;
+  if (a.queue !== undefined && typeof a.queue !== "boolean") return null;
+  if (a.reference_images !== undefined && !isReferenceList(a.reference_images)) return null;
+  return {
+    timeoutMs: a.timeout_s === undefined ? undefined : (a.timeout_s as number) * 1000,
+    queue: a.queue === true,
+    references: a.reference_images as string[] | undefined,
+  };
+}
+
+const JOB_OPTION_KEYS = ["timeout_s", "queue", "reference_images"];
+const JOB_OPTIONS_HELP =
+  `timeout_s? (integer ${MIN_JOB_TIMEOUT_S}..${MAX_JOB_TIMEOUT_S}), queue? (boolean), reference_images? (1..${MAX_REFERENCE_IMAGES} paths)`;
+
+function referenceErr(e: unknown): ToolResult {
+  if (e instanceof ReferenceImageError) {
+    const obj = { error: { code: "REFERENCE_IMAGE_INVALID", message: `reference_images[${e.index}] rejected: ${e.reason}.`, index: e.index, reason: e.reason } };
+    return { content: [{ type: "text", text: JSON.stringify(obj) }], structuredContent: obj, isError: true };
+  }
+  return err("REFERENCE_IMAGE_INVALID", "reference_images rejected.");
+}
+
+function referencesUnsupported(): ToolResult {
+  return err(
+    "REFERENCE_IMAGES_UNSUPPORTED",
+    "The installed Codex app-server schema does not list localImage turn input, so reference_images cannot be sent. No job was started. " +
+      "Workaround: codex_task_start with the files in cwd and a prompt that asks Codex to open them with its image viewing tool.",
+  );
 }
 
 export class ToolHandler {
@@ -292,13 +440,21 @@ export class ToolHandler {
   private shutdownDone: Promise<void> | undefined;
   /** Image job id -> session handle, for polling metadata (bounded). */
   private readonly jobSessions = new Map<string, string>();
+  /** Default job timeout as configured (codex_status limits). */
+  private readonly timeoutConfig: JobTimeoutResolution;
+  /** Last successful plugin / MCP listing, shown (marked stale) when a later probe fails. */
+  private readonly listingCache: { plugins: CachedListing<PluginSummary> | undefined; mcp_servers: CachedListing<McpServerSummary> | undefined } = {
+    plugins: undefined,
+    mcp_servers: undefined,
+  };
 
   /** Throws BridgeModeError (static message) when CODEX_BRIDGE_MODE is set but invalid. */
   constructor(private readonly deps: ServerDeps = {}) {
     this.env = deps.env ?? process.env;
     this.#mode = requireBridgeMode(this.env);
     this.outputRoot = resolveOutputRoot(this.env);
-    this.jobs = new JobManager(deps.wallMs ?? wallFromEnv(this.env));
+    this.timeoutConfig = resolveJobTimeout(this.env);
+    this.jobs = new JobManager(deps.wallMs ?? this.timeoutConfig.seconds * 1000);
     this.sessions = new ImageSessionStore(deps.now);
     this.createTransport =
       deps.createTransport ??
@@ -354,30 +510,8 @@ export class ToolHandler {
     if (!isToolName(name)) return err("UNKNOWN_TOOL", "Unknown tool.");
     if (!this.exposed(name)) return disabled(name, this.#mode);
     switch (name) {
-      case "codex_status": {
-        if (!exactKeys(args, [])) return err("INVALID_ARGUMENTS", "codex_status accepts no arguments.");
-        const s = await getStatus(
-          this.deps.versionProbe ?? versionProbeFor(this.env),
-          this.deps.capabilityProbe,
-          this.outputRoot,
-          launcherStatus(resolveCodexBin(this.env)),
-        );
-        const active = this.jobs.active;
-        return ok({
-          ...s,
-          bridge_mode: this.#mode,
-          active_job_id: active !== undefined && this.visibleJob(active) ? active : null,
-          image_sessions: {
-            // Discovered on the first image job; "unknown" until then.
-            continuity: this.lastCaps === undefined ? "unknown" : this.lastCaps.continuity ? "available" : "unavailable",
-            retained: this.sessions.size,
-            max_sessions: SESSION_LIMITS.maxSessions,
-            idle_ttl_seconds: SESSION_LIMITS.idleTtlMs / 1000,
-            max_turns: SESSION_LIMITS.maxTurns,
-            max_prompt_chars: SESSION_LIMITS.maxPromptChars,
-          },
-        });
-      }
+      case "codex_status":
+        return this.status(args);
       case "codex_task_start":
         return this.start(name, args);
       case "codex_image_generate":
@@ -387,11 +521,20 @@ export class ToolHandler {
         if (!a || typeof a.job_id !== "string") return err("INVALID_ARGUMENTS", "Expected {job_id}.");
         const v = this.visibleJob(a.job_id);
         if (!v) return err("UNKNOWN_JOB", "No such job.");
-        const handle = this.jobSessions.get(v.job_id);
-        if (handle === undefined) return ok({ ...v });
-        const st = this.sessions.state(handle);
-        const next = v.state === "running" ? "wait" : st.usable ? "reuse_only_for_related_edits" : "fresh_session_required";
-        return ok({ ...v, session: { session_handle: handle, usable: st.usable, revoked_reason: st.reason, rollover_reason: st.rollover, next_action: next } });
+        return ok(this.jobResult(v));
+      }
+      case "codex_task_wait": {
+        const a = pickKeys(args, ["job_id"], ["max_wait_s"]);
+        const w = a?.max_wait_s;
+        if (!a || typeof a.job_id !== "string" || (w !== undefined && !(Number.isInteger(w) && (w as number) >= 1 && (w as number) <= MAX_WAIT_S))) {
+          return err("INVALID_ARGUMENTS", `Expected {job_id, max_wait_s? (integer 1..${MAX_WAIT_S})}.`);
+        }
+        if (!this.visibleJob(a.job_id)) return err("UNKNOWN_JOB", "No such job.");
+        const t0 = Date.now();
+        await this.jobs.wait(a.job_id, ((w as number | undefined) ?? DEFAULT_WAIT_S) * 1000, this.lifecycle.signal);
+        const v = this.visibleJob(a.job_id);
+        if (!v) return err("UNKNOWN_JOB", "No such job.");
+        return ok({ ...this.jobResult(v), waited_ms: Date.now() - t0 });
       }
       case "codex_task_cancel": {
         const a = exactKeys(args, ["job_id"]);
@@ -399,10 +542,192 @@ export class ToolHandler {
         const v = this.visibleJob(a.job_id);
         if (!v) return err("UNKNOWN_JOB", "No such job.");
         const cancelled = this.jobs.cancel(a.job_id);
-        return ok({ job_id: a.job_id, cancel_requested: cancelled, state: v.state });
+        return ok({ job_id: a.job_id, cancel_requested: cancelled, state: this.jobs.get(a.job_id)?.state ?? v.state });
       }
       default:
         return err("UNKNOWN_TOOL", "Unknown tool.");
+    }
+  }
+
+  /** Job view plus image-session polling metadata. */
+  private jobResult(v: JobView): Record<string, unknown> {
+    const handle = this.jobSessions.get(v.job_id);
+    if (handle === undefined) return { ...v };
+    const st = this.sessions.state(handle);
+    const waiting = v.state === "running" || v.state === "queued";
+    const next = waiting ? "wait" : st.usable ? "reuse_only_for_related_edits" : "fresh_session_required";
+    return { ...v, session: { session_handle: handle, usable: st.usable, revoked_reason: st.reason, rollover_reason: st.rollover, next_action: next } };
+  }
+
+  private async status(args: unknown): Promise<ToolResult> {
+    if (!exactKeys(args, [])) return err("INVALID_ARGUMENTS", "codex_status accepts no arguments.");
+    const s = await getStatus(
+      this.deps.versionProbe ?? versionProbeFor(this.env),
+      this.deps.capabilityProbe,
+      this.outputRoot,
+      launcherStatus(resolveCodexBin(this.env)),
+    );
+    // A listing that failed this time (for example offline) is replaced by the
+    // last successful one, marked stale, as long as the CLI itself answered.
+    if (s.codex_cli_available) {
+      const at = new Date().toISOString();
+      const keep = <T>(fresh: Listing<T>, slot: CachedListing<T> | undefined): [Listing<T>, CachedListing<T> | undefined] =>
+        fresh.available ? [fresh, { at, listing: fresh }] : slot ? [{ ...slot.listing, reason: fresh.reason, stale: true, cached_at: slot.at }, slot] : [fresh, slot];
+      [s.plugins, this.listingCache.plugins] = keep(s.plugins, this.listingCache.plugins);
+      [s.mcp_servers, this.listingCache.mcp_servers] = keep(s.mcp_servers, this.listingCache.mcp_servers);
+    }
+    const active = this.jobs.active;
+    const visible = (v: JobView): boolean => this.#mode === "general" || v.kind === "image";
+    const last = this.jobs.lastFinished(visible);
+    return ok({
+      ...s,
+      image_edit_enabled: this.lastCaps?.localImageInput === true,
+      bridge_mode: this.#mode,
+      active_job_id: active !== undefined && this.visibleJob(active) ? active : null,
+      queued_job_ids: this.jobs.queued.filter((id) => this.visibleJob(id) !== undefined),
+      last_job: last
+        ? {
+            job_id: last.job_id,
+            kind: last.kind,
+            state: last.state,
+            finished_at: last.finished_at,
+            error_code: last.error?.code ?? null,
+            likely_cause: last.error?.likely_cause ?? null,
+            partial_files: last.partial_files?.length ?? 0,
+          }
+        : null,
+      limits: {
+        job_timeout_s: {
+          default: Math.round(this.jobs.defaultWallMs / 1000),
+          source: this.timeoutConfig.source,
+          env_issue: this.timeoutConfig.issue,
+          min: MIN_JOB_TIMEOUT_S,
+          max: MAX_JOB_TIMEOUT_S,
+        },
+        max_images_per_job: MAX_SAVED_IMAGES,
+        max_queued_jobs: MAX_QUEUED_JOBS,
+        retained_jobs: MAX_COMPLETED_JOBS,
+        max_wait_s: MAX_WAIT_S,
+      },
+      reference_images: {
+        // Known from the installed schema after the first image (or reference) job; "unknown" until then.
+        support: this.lastCaps === undefined ? "unknown" : this.lastCaps.localImageInput ? "available" : "unavailable",
+        max_count: MAX_REFERENCE_IMAGES,
+        max_bytes_each: MAX_REFERENCE_IMAGE_BYTES,
+        max_total_bytes: MAX_REFERENCE_TOTAL_BYTES,
+      },
+      image_sessions: {
+        // Discovered on the first image job; "unknown" until then.
+        continuity: this.lastCaps === undefined ? "unknown" : this.lastCaps.continuity ? "available" : "unavailable",
+        retained: this.sessions.size,
+        max_sessions: SESSION_LIMITS.maxSessions,
+        idle_ttl_seconds: SESSION_LIMITS.idleTtlMs / 1000,
+        max_turns: SESSION_LIMITS.maxTurns,
+        max_prompt_chars: SESSION_LIMITS.maxPromptChars,
+      },
+    });
+  }
+
+  /** BUSY / QUEUE_FULL when a new job cannot start or queue now; null when it can. */
+  private busy(queue: boolean): ToolResult | null {
+    if (this.jobs.active === undefined) return null;
+    if (!queue) return err("BUSY", "Another job is active. Pass queue: true to queue behind it, or use codex_task_wait.");
+    if (this.jobs.queueFull) return err("QUEUE_FULL", `The queue already holds ${MAX_QUEUED_JOBS} jobs; wait for one to finish.`);
+    return null;
+  }
+
+  private startResult(view: JobView, references: number, extra: Record<string, unknown> = {}): ToolResult {
+    const r: Record<string, unknown> = { job_id: view.job_id, state: view.state, timeout_s: view.timeout_s };
+    if (view.queue_position !== undefined) r.queue_position = view.queue_position;
+    if (references > 0) r.reference_images = references;
+    return ok({ ...r, ...extra });
+  }
+
+  /** A queued job re-checks cwd and its reference images when it actually starts. */
+  private async revalidate(cwd: string, references: string[] | undefined): Promise<string[]> {
+    try {
+      if ((await validateCwd(cwd)) !== cwd) throw new Error("cwd");
+    } catch {
+      throw new TaskError("POLICY_MISMATCH", undefined, { phase: "spawn", policy_mismatch: "cwd" });
+    }
+    if (!references) return [];
+    try {
+      return await validateReferenceImages(references, cwd);
+    } catch {
+      throw new TaskError("REFERENCE_IMAGE_INVALID", undefined, { phase: "spawn" });
+    }
+  }
+
+  /**
+   * Runs one delegated turn and saves its native images incrementally
+   * (ImageSink): each completed image is verified and copied as soon as Codex
+   * reports it, and is listed in progress.files_so_far. Success requires every
+   * reported image item to verify. On any failure, timeout or cancel, verified
+   * copies are kept; unless the bridge is shutting down, completed images not
+   * copied yet are salvaged (also from the thread's generated_images folder),
+   * and all of them are attached as partial_files. Every filesystem step is
+   * awaited before this returns, so the job stays BUSY until then.
+   */
+  private async runTurnSaving(
+    run: Pick<RunOptions, "prompt" | "cwd" | "image" | "strictImageEvents" | "referenceImages">,
+    root: string,
+    signal: AbortSignal,
+    timeoutMs: number,
+    progress: (get: () => JobProgress) => void,
+    requireImage: boolean,
+  ): Promise<{ outcome: TurnOutcome; files: ImageFile[] }> {
+    const home = codexHome(this.env);
+    const sink = new ImageSink(root, [home], { checkpoint: () => throwIfAborted(signal), afterStep: this.deps.imageAfterStep });
+    let state: (() => TurnRunState) | undefined;
+    let saving = false;
+    progress(() => {
+      const st = state?.();
+      return {
+        phase: saving ? "saving" : (st?.phase ?? "spawn"),
+        images_completed: st?.imagesCompleted ?? 0,
+        files_so_far: sink.files(),
+        first_model_event_ms: st?.firstModelEventMs ?? null,
+        last_event_at: st?.lastEventAt ? new Date(st.lastEventAt).toISOString() : null,
+      };
+    });
+    try {
+      const outcome = await runDelegatedTurn({
+        ...run,
+        timeoutMs,
+        signal,
+        createTransport: this.createTransport,
+        clientVersion: SERVER_VERSION,
+        onImage: (p) => sink.add(p),
+        onState: (get) => void (state = get),
+      });
+      saving = true;
+      throwIfAborted(signal);
+      let paths: string[];
+      try {
+        paths = nativeSavedPaths(outcome);
+      } catch (e) {
+        throw e instanceof ImageError ? new TaskError(e.code) : e;
+      }
+      if (paths.length === 0) {
+        if (requireImage) throw new TaskError("NO_IMAGE_PRODUCED");
+        return { outcome, files: [] };
+      }
+      for (const p of paths) sink.add(p);
+      await sink.drain();
+      throwIfAborted(signal);
+      if (sink.rootUnavailable) throw new TaskError("OUTPUT_ROOT_UNAVAILABLE");
+      if (sink.failures > 0) throw new TaskError("IMAGE_VERIFICATION_FAILED");
+      return { outcome, files: sink.files() };
+    } catch (e) {
+      const te = e instanceof TaskError ? e : new TaskError("PROTOCOL_ERROR");
+      if (!this.closing) {
+        await sink.salvage();
+        const st = state?.();
+        await sink.salvageThreadFolder(home, st?.threadId ?? null, st?.turnStartedAt ?? null);
+      }
+      await sink.finish();
+      te.partialFiles = sink.files();
+      throw te;
     }
   }
 
@@ -411,9 +736,10 @@ export class ToolHandler {
     if (name !== "codex_task_start" && name !== "codex_image_generate") return err("UNKNOWN_TOOL", "Unknown tool.");
     if (!this.exposed(name)) return disabled(name, this.#mode);
     if (name === "codex_image_generate") return this.startImage(args);
-    const a = exactKeys(args, ["prompt", "cwd"]);
-    if (!a || typeof a.prompt !== "string" || a.prompt.trim().length === 0 || a.prompt.length > MAX_PROMPT_CHARS) {
-      return err("INVALID_ARGUMENTS", `Expected {prompt (1..${MAX_PROMPT_CHARS} chars), cwd}.`);
+    const a = pickKeys(args, ["prompt", "cwd"], JOB_OPTION_KEYS);
+    const o = a ? jobOptions(a) : null;
+    if (!a || !o || typeof a.prompt !== "string" || a.prompt.trim().length === 0 || a.prompt.length > MAX_PROMPT_CHARS) {
+      return err("INVALID_ARGUMENTS", `Expected {prompt (1..${MAX_PROMPT_CHARS} chars), cwd, ${JOB_OPTIONS_HELP}}.`);
     }
     // Both tools may save images; an invalid root fails before any job begins.
     if (!this.outputRoot.ok) return err("OUTPUT_ROOT_INVALID", this.outputRoot.message);
@@ -424,43 +750,38 @@ export class ToolHandler {
     } catch (e) {
       return err("INVALID_CWD", e instanceof CwdError ? e.message : "cwd rejected");
     }
-    if (this.closing) return shuttingDown();
-    if (this.jobs.active !== undefined) return err("BUSY", "Another job is active.");
-    const prompt = a.prompt;
-    const view = this.jobs.start("task", async (signal, timeoutMs, _jobId, own) => {
-      const outcome = await runDelegatedTurn({
-        prompt,
-        cwd,
-        timeoutMs,
-        signal,
-        createTransport: this.createTransport,
-        clientVersion: SERVER_VERSION,
-      });
-      const noImages = outcome.images.length === 0 && !outcome.imagesOverflow;
-      const files = noImages ? [] : await this.collect(outcome, root, signal, own);
-      return { text: outcome.text, text_truncated: outcome.textTruncated, image_items: outcome.images.length, files };
-    });
-    if (!view) return err("BUSY", "Another job is active.");
-    return ok({ job_id: view.job_id, state: view.state });
-  }
-
-  /**
-   * Post-processing stays inside the job deadline/cancellation: every await
-   * completes (no abandoned writes), the signal is checked between awaits, and
-   * the owned output dir is removed by JobManager on failure.
-   */
-  private async collect(o: TurnOutcome, root: string, signal: AbortSignal, own: (c: () => Promise<void>) => void): Promise<ImageFile[]> {
-    const checkpoint = (): void => throwIfAborted(signal);
-    checkpoint();
-    let files: ImageFile[];
-    try {
-      files = await collectImage(o, root, [codexHome(this.env)], { checkpoint, own, afterStep: this.deps.imageAfterStep });
-    } catch (e) {
-      if (e instanceof ImageError) throw new TaskError(e.code);
-      throw e;
+    let refs: string[] = [];
+    if (o.references) {
+      try {
+        refs = await validateReferenceImages(o.references, cwd);
+      } catch (e) {
+        return referenceErr(e);
+      }
     }
-    checkpoint();
-    return files;
+    if (this.closing) return shuttingDown();
+    const busy = this.busy(o.queue);
+    if (busy) return busy;
+    if (refs.length > 0) {
+      const caps = await this.imageCapabilities(resolveCodexBin(this.env).path);
+      if (this.closing || caps.reason === "discovery_cancelled") return shuttingDown();
+      if (!caps.localImageInput) return referencesUnsupported();
+      const again = this.busy(o.queue);
+      if (again) return again;
+    }
+    const prompt = a.prompt;
+    const queued = this.jobs.active !== undefined;
+    const view = this.jobs.start(
+      "task",
+      async (signal, timeoutMs, _jobId, _own, progress) => {
+        const referenceImages = queued ? await this.revalidate(cwd, o.references) : refs;
+        const { outcome, files } = await this.runTurnSaving({ prompt, cwd, referenceImages }, root, signal, timeoutMs, progress, false);
+        return { text: outcome.text, text_truncated: outcome.textTruncated, image_items: outcome.images.length, files };
+      },
+      undefined,
+      { wallMs: o.timeoutMs, queue: o.queue },
+    );
+    if (!view) return this.closing ? shuttingDown() : (this.busy(o.queue) ?? err("BUSY", "Another job is active."));
+    return this.startResult(view, refs.length);
   }
 
   /**
@@ -508,23 +829,32 @@ export class ToolHandler {
 
   private async startImage(args: unknown): Promise<ToolResult> {
     if (!this.exposed("codex_image_generate")) return disabled("codex_image_generate", this.#mode);
-    const a = pickKeys(args, ["prompt", "cwd"], ["session_handle", "fresh_session"]);
+    const a = pickKeys(args, ["prompt", "cwd"], ["session_handle", "fresh_session", "aspect", ...JOB_OPTION_KEYS]);
+    const o = a ? jobOptions(a) : null;
     if (
       !a ||
+      !o ||
       typeof a.prompt !== "string" ||
       a.prompt.trim().length === 0 ||
       a.prompt.length > MAX_PROMPT_CHARS ||
-      (a.fresh_session !== undefined && typeof a.fresh_session !== "boolean")
+      (a.fresh_session !== undefined && typeof a.fresh_session !== "boolean") ||
+      (a.aspect !== undefined && !isAspect(a.aspect))
     ) {
-      return err("INVALID_ARGUMENTS", `Expected {prompt (1..${MAX_PROMPT_CHARS} chars), cwd, session_handle?, fresh_session?}.`);
+      return err(
+        "INVALID_ARGUMENTS",
+        `Expected {prompt (1..${MAX_PROMPT_CHARS} chars), cwd, session_handle?, fresh_session?, aspect? (${Object.keys(ASPECTS).join(", ")}), ${JOB_OPTIONS_HELP}}.`,
+      );
     }
     // Only bridge-issued handles; a native thread id or any other string is never accepted.
     if (a.session_handle !== undefined && !isSessionHandleShape(a.session_handle)) {
       return err("INVALID_ARGUMENTS", "session_handle must be a handle returned by codex_image_generate; native thread ids are not accepted.");
     }
+    if (o.queue && a.session_handle !== undefined) {
+      return err("INVALID_ARGUMENTS", "queue cannot be combined with session_handle: wait for the previous job (codex_task_wait), then continue the session.");
+    }
     const handle = a.session_handle as string | undefined;
     const fresh = a.fresh_session === true;
-    const userPrompt = a.prompt;
+    const userPrompt = withAspect(a.prompt, isAspect(a.aspect) ? a.aspect : undefined);
     if (!this.outputRoot.ok) return err("OUTPUT_ROOT_INVALID", this.outputRoot.message);
     const root = this.outputRoot.path;
     let cwd: string;
@@ -533,14 +863,25 @@ export class ToolHandler {
     } catch (e) {
       return err("INVALID_CWD", e instanceof CwdError ? e.message : "cwd rejected");
     }
+    let refs: string[] = [];
+    if (o.references) {
+      try {
+        refs = await validateReferenceImages(o.references, cwd);
+      } catch (e) {
+        return referenceErr(e);
+      }
+    }
     // BUSY and SHUTTING_DOWN never consume, revoke or reset a handle: both are checked before any session change.
     if (this.closing) return shuttingDown();
-    if (this.jobs.active !== undefined) return err("BUSY", "Another job is active.");
+    const busy = this.busy(o.queue);
+    if (busy) return busy;
     const launcher = resolveCodexBin(this.env).path;
     const caps = await this.imageCapabilities(launcher);
     // A discovery cancelled by shutdown never falls back to a generation.
     if (this.closing || caps.reason === "discovery_cancelled") return shuttingDown();
-    if (this.jobs.active !== undefined) return err("BUSY", "Another job is active.");
+    const again = this.busy(o.queue);
+    if (again) return again;
+    if (refs.length > 0 && !caps.localImageInput) return referencesUnsupported();
 
     const ctx: SessionContext = { cwd, mode: this.#mode, outputRoot: root, launcher: launcher ?? "", policy: POLICY_KEY };
     let session: ImageSession | undefined;
@@ -560,7 +901,7 @@ export class ToolHandler {
 
     // Native developer instructions keep the single-image guidance out of the
     // visible user message; without them the prompt wrapper is the fallback.
-    const prompt = caps.nativeInstructions ? userPrompt : buildImagePrompt(userPrompt);
+    const prompt = caps.nativeInstructions ? userPrompt : buildImagePrompt(userPrompt, refs.length > 0);
     let native: { threadId: string; model: string } | undefined;
     let jobIdSeen: string | undefined;
     const image: ImageThreadOptions | undefined = caps.nativeInstructions
@@ -578,26 +919,32 @@ export class ToolHandler {
         : { session_handle: null, session: { continuity: "unavailable", reason: caps.reason } };
 
     if (session) this.sessions.lease(session);
+    const queued = this.jobs.active !== undefined;
     const view = this.jobs.start(
       "image",
-      async (signal, timeoutMs, jobId, own) => {
+      async (signal, timeoutMs, jobId, _own, progress) => {
         jobIdSeen = jobId;
-        const outcome = await runDelegatedTurn({
-          prompt,
-          cwd,
-          timeoutMs,
+        const referenceImages = queued ? await this.revalidate(cwd, o.references) : refs;
+        // Every image job, including the prompt-wrapper fallback, reads only its own thread+turn.
+        const { files } = await this.runTurnSaving(
+          { prompt, cwd, strictImageEvents: true, referenceImages, ...(image ? { image } : {}) },
+          root,
           signal,
-          createTransport: this.createTransport,
-          clientVersion: SERVER_VERSION,
-          // Every image job, including the prompt-wrapper fallback, reads only its own thread+turn.
-          strictImageEvents: true,
-          ...(image ? { image } : {}),
-        });
-        const files = await this.collect(outcome, root, signal, own);
-        const version = await codexVersion(this.deps.versionProbe ?? versionProbeFor(this.env));
-        throwIfAborted(signal);
-        const result: ImageResult = { job_id: jobId, files, codex_version: version, ...sessionMeta(jobId) };
-        return result;
+          timeoutMs,
+          progress,
+          true,
+        );
+        try {
+          const version = await codexVersion(this.deps.versionProbe ?? versionProbeFor(this.env));
+          throwIfAborted(signal);
+          const result: ImageResult = { job_id: jobId, files, codex_version: version, ...sessionMeta(jobId) };
+          return result;
+        } catch (e) {
+          // The saved images stay; a late cancel or deadline reports them as partial_files.
+          const te = e instanceof TaskError ? e : new TaskError("PROTOCOL_ERROR");
+          te.partialFiles = files;
+          throw te;
+        }
       },
       (state) => {
         if (!session) return;
@@ -605,16 +952,17 @@ export class ToolHandler {
         if (state === "succeeded" && native && jobIdSeen) this.sessions.succeed(session, native.threadId, native.model, userPrompt.length, jobIdSeen);
         else this.sessions.fail(session);
       },
+      { wallMs: o.timeoutMs, queue: o.queue },
     );
     if (!view) {
       if (session) this.sessions.release(session);
-      return err("BUSY", "Another job is active.");
+      return this.closing ? shuttingDown() : (this.busy(o.queue) ?? err("BUSY", "Another job is active."));
     }
     if (session) {
       this.jobSessions.set(view.job_id, session.handle);
       while (this.jobSessions.size > MAX_JOB_SESSIONS) this.jobSessions.delete(this.jobSessions.keys().next().value!);
     }
-    return ok({ job_id: view.job_id, state: view.state, ...sessionMeta(view.job_id) });
+    return this.startResult(view, refs.length, sessionMeta(view.job_id));
   }
 }
 

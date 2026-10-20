@@ -418,7 +418,11 @@ test("codexErrorInfo other: diagnostic carries only the message class and whitel
   const fake = new FakeAppServer(completingScript([turnCompleted("failed", { message: msg, codexErrorInfo: "other" })]));
   await assert.rejects(runDelegatedTurn(opts(fake)), (e: unknown) => {
     assert.ok(e instanceof TaskError && e.code === "TURN_FAILED");
-    assert.deepEqual(e.diagnostic, { phase: "turn", codex_error_info: "other", turn_message_class: "hook_aborted", http_status: 503 });
+    const { first_model_event_ms, last_event_ms_ago, ...rest } = e.diagnostic!;
+    assert.deepEqual(rest, { phase: "turn", codex_error_info: "other", turn_message_class: "hook_aborted", http_status: 503 });
+    // Turn timing is attached to turn-phase failures; turn/completed alone is not model activity.
+    assert.equal(first_model_event_ms, null);
+    assert.equal(typeof last_event_ms_ago, "number");
     const s = JSON.stringify(e) + e.message;
     for (const leak of ["SECRET", "/Users", "gate"]) assert.ok(!s.includes(leak), leak);
     return true;

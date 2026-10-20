@@ -9,12 +9,13 @@ import { APPROVAL_POLICY, APPROVALS_REVIEWER, initializeParams, SANDBOX_MODE } f
 
 const VERSION_TIMEOUT_MS = 5_000;
 const VERSION_MAX_BYTES = 4096;
-const PROBE_TIMEOUT_MS = 20_000;
+/** Total time the plugin / MCP server listing may take; codex_status never waits longer for it. */
+export const STATUS_PROBE_BUDGET_MS = 10_000;
 const MAX_LISTED = 100;
 const MCP_PAGE_LIMIT = 50;
 const MAX_MCP_PAGES = 4;
 const MAX_CURSOR_CHARS = 1024;
-export const SERVER_VERSION = "0.2.3";
+export const SERVER_VERSION = "0.3.0";
 
 export interface VersionProbeResult {
   ok: boolean;
@@ -111,6 +112,10 @@ export interface Listing<T> {
   truncated: boolean;
   /** Peer still advertised a next page when paging stopped; null when unknown. */
   has_more: boolean | null;
+  /** Set when this probe failed and the last successful listing is shown instead. */
+  stale?: true;
+  /** When the shown (stale) listing was taken. */
+  cached_at?: string;
 }
 
 export interface PluginSummary {
@@ -192,12 +197,12 @@ export function mcpStatusListParams(cursor: string | null): Record<string, unkno
   return p;
 }
 
-async function listMcpServers(client: CodexRpcClient): Promise<Listing<McpServerSummary>> {
+async function listMcpServers(client: CodexRpcClient, remaining: () => number): Promise<Listing<McpServerSummary>> {
   const items: McpServerSummary[] = [];
   let cursor: string | null = null;
   let truncated = false;
   for (let page = 0; page < MAX_MCP_PAGES; page++) {
-    const r = appendMcpPage(await client.request("mcpServerStatus/list", mcpStatusListParams(cursor), { timeoutMs: PROBE_TIMEOUT_MS }), items);
+    const r = appendMcpPage(await client.request("mcpServerStatus/list", mcpStatusListParams(cursor), { timeoutMs: remaining() }), items);
     truncated ||= r.capped;
     cursor = r.next;
     if (cursor === null) return { available: true, reason: null, items, truncated, has_more: false };
@@ -241,10 +246,18 @@ function defaultProbeTransport(): CodexTransport {
   return spawnAppServer({ bin, cwd: probeCwd() });
 }
 
-/** Read-only listing via plugin/installed and mcpServerStatus/list. No thread or turn is started. */
+/**
+ * Read-only listing via plugin/installed and mcpServerStatus/list. No thread or
+ * turn is started. All requests share one budget (`budgetMs`), so the probe
+ * never takes much longer than that even when Codex or the network hangs; the
+ * app-server is killed afterwards either way.
+ */
 export async function probeCapabilities(
   createTransport: () => CodexTransport = defaultProbeTransport,
+  budgetMs: number = STATUS_PROBE_BUDGET_MS,
 ): Promise<CapabilityProbeResult> {
+  const deadline = Date.now() + budgetMs;
+  const remaining = (): number => Math.max(1, deadline - Date.now());
   let client: CodexRpcClient;
   try {
     client = new CodexRpcClient(createTransport());
@@ -253,20 +266,20 @@ export async function probeCapabilities(
   }
   try {
     try {
-      await client.request("initialize", initializeParams(SERVER_VERSION), { timeoutMs: PROBE_TIMEOUT_MS });
+      await client.request("initialize", initializeParams(SERVER_VERSION), { timeoutMs: remaining() });
       client.notify("initialized");
     } catch {
       return { plugins: unknownListing("initialize failed"), mcp_servers: unknownListing("initialize failed") };
     }
     let plugins: Listing<PluginSummary>;
     try {
-      plugins = pluginListing(await client.request("plugin/installed", {}, { timeoutMs: PROBE_TIMEOUT_MS }));
+      plugins = pluginListing(await client.request("plugin/installed", {}, { timeoutMs: remaining() }));
     } catch (e) {
       plugins = unknownListing(listingFailureReason("plugin/installed", e));
     }
     let mcp: Listing<McpServerSummary>;
     try {
-      mcp = await listMcpServers(client);
+      mcp = await listMcpServers(client, remaining);
     } catch (e) {
       mcp = unknownListing(listingFailureReason("mcpServerStatus/list", e));
     }
@@ -298,7 +311,8 @@ export interface CodexStatus {
   /** True only when the output root configuration is valid. */
   image_generate_enabled: boolean;
   image_output: ImageOutputStatus;
-  image_edit_enabled: false;
+  /** True once reference images (native image input) are known to be supported; see reference_images. */
+  image_edit_enabled: boolean;
   note: string;
 }
 
@@ -321,17 +335,18 @@ export async function getStatus(
   outputRoot: OutputRootResolution = resolveOutputRoot(),
   runtime: LauncherStatus = launcherStatus(resolveCodexBin()),
 ): Promise<CodexStatus> {
-  const version = await codexVersion(probe);
-  let caps: CapabilityProbeResult;
-  if (version === null) {
-    caps = { plugins: unknownListing("codex CLI unavailable"), mcp_servers: unknownListing("codex CLI unavailable") };
-  } else {
-    try {
-      caps = await capabilities();
-    } catch {
-      caps = { plugins: unknownListing("probe failed"), mcp_servers: unknownListing("probe failed") };
-    }
-  }
+  // The version check and the bounded listing run side by side; a listing
+  // is only reported when the CLI itself answered.
+  const failed = (reason: string): CapabilityProbeResult => ({ plugins: unknownListing(reason), mcp_servers: unknownListing(reason) });
+  let timer: NodeJS.Timeout | undefined;
+  const listing = Promise.race([
+    capabilities().catch(() => failed("probe failed")),
+    new Promise<CapabilityProbeResult>((r) => {
+      timer = setTimeout(() => r(failed("status budget exceeded")), STATUS_PROBE_BUDGET_MS + 2_000);
+    }),
+  ]).finally(() => clearTimeout(timer));
+  const [version, probed] = await Promise.all([codexVersion(probe), listing]);
+  const caps = version === null ? failed("codex CLI unavailable") : probed;
   return {
     server: "codex-claude-bridge",
     server_version: SERVER_VERSION,

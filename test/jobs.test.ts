@@ -68,7 +68,8 @@ test("a rejecting cleanup is best effort: error withheld, job still released wit
   assert.ok(view);
   const done = await settled(jobs, view.job_id);
   assert.equal(done.state, "failed");
-  assert.deepEqual(done.error, { code: "IMAGE_VERIFICATION_FAILED" });
+  assert.deepEqual(done.error, { code: "IMAGE_VERIFICATION_FAILED", retryable: false, likely_cause: "local" });
+  assert.deepEqual(done.partial_files, []);
   assert.equal(done.result, null);
   assert.ok(!JSON.stringify(done).includes("EACCES"));
   assert.equal(jobs.active, undefined);
