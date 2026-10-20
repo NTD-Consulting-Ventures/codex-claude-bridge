@@ -175,6 +175,11 @@ function obj(v: unknown): Record<string, unknown> | undefined {
 
 /** JSON-RPC error code returned for every server-initiated request. */
 export const DENIED_CODE = -32001;
+/** Server-initiated requests a handler may hold open at the same time. */
+export const MAX_ANSWERING = 4;
+
+/** Answers one server-initiated request: `{result}` to respond, null to deny. */
+export type ServerRequestHandler = (method: string, params: unknown) => Promise<{ result: unknown } | null> | { result: unknown } | null;
 const DENIED_MESSAGE = "Request denied by codex-image-mcp: server-initiated requests are not permitted.";
 
 export function classifyRpcError(err: unknown): CodexErrorKind {
@@ -268,6 +273,9 @@ export class CodexRpcClient {
   private notificationHandler: NotificationHandler | undefined;
   private serverRequestObserver: ((method: string) => void) | undefined;
   private closeObserver: ((kind: CodexErrorKind) => void) | undefined;
+  private requestHandler: { methods: ReadonlySet<string>; answer: ServerRequestHandler } | undefined;
+  /** Server-initiated requests currently held open for an answer. */
+  private readonly answering = new Set<Id>();
 
   /** Diagnostic counters only; contain no peer content. */
   readonly stats = { lateResponses: 0, deniedServerRequests: 0, droppedStderrBytes: 0, invalidFrames: 0 };
@@ -290,6 +298,17 @@ export class CodexRpcClient {
   /** Called (after the denial is written) with the method of each server-initiated request. */
   onServerRequest(observer: (method: string) => void): void {
     this.serverRequestObserver = observer;
+  }
+
+  /**
+   * Lets `answer` reply to server-initiated requests whose method is in
+   * `methods` (approvals). The request stays open until `answer` settles; a
+   * `{result}` is sent as the response, `null` or a rejection sends the usual
+   * denial. Other methods, and requests beyond MAX_ANSWERING held at once, are
+   * denied immediately as before (and reported to onServerRequest).
+   */
+  answerServerRequests(methods: ReadonlySet<string>, answer: ServerRequestHandler): void {
+    this.requestHandler = { methods, answer };
   }
 
   /** Called once when the client closes, with the reason (bounds, protocol, closed, ...). */
@@ -449,9 +468,34 @@ export class CodexRpcClient {
     const hasMethod = typeof m.method === "string";
 
     if (hasMethod && hasId) {
+      const id = m.id as Id;
+      const method = m.method as string;
+      const h = this.requestHandler;
+      if (h && h.methods.has(method) && !this.answering.has(id) && this.answering.size < MAX_ANSWERING) {
+        // An installed handler (approvals) answers this request later; nothing is fabricated here.
+        this.answering.add(id);
+        let answered: Promise<{ result: unknown } | null>;
+        try {
+          answered = Promise.resolve(h.answer(method, m.params));
+        } catch {
+          answered = Promise.resolve(null);
+        }
+        void answered
+          .catch(() => null)
+          .then((a) => {
+            if (this.closed) return;
+            if (a) this.writeSafe({ jsonrpc: "2.0", id, result: a.result });
+            else {
+              this.stats.deniedServerRequests++;
+              this.writeSafe({ jsonrpc: "2.0", id, error: { code: DENIED_CODE, message: DENIED_MESSAGE } });
+            }
+          })
+          .finally(() => this.answering.delete(id));
+        return;
+      }
       // Server-initiated request (approvals, elicitation, auth refresh, dynamic tools).
-      // Always denied with an error; no result is ever fabricated. The observer
-      // only learns the method name so the caller can fail the job.
+      // Denied with an error unless a handler answers it above; no result is ever
+      // fabricated. The observer only learns the method name so the caller can fail the job.
       this.stats.deniedServerRequests++;
       this.writeSafe({ jsonrpc: "2.0", id: m.id, error: { code: DENIED_CODE, message: DENIED_MESSAGE } });
       try {

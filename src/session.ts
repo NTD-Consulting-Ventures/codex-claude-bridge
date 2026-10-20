@@ -22,6 +22,16 @@ import { selectDefaultModel, type ModelSelectionFailure } from "./model-select.j
 import { THREAD_NAME_SET } from "./protocol-capabilities.js";
 import { classifyTurnMessage, httpStatusFromMessage, type TurnMessageClass } from "./turn-error.js";
 import type { ImageFile } from "./image-service.js";
+import {
+  APPROVAL_METHODS,
+  approvalInScope,
+  approvalResponse,
+  fileChangesOf,
+  summarizeApproval,
+  type ApprovalDecision,
+  type ApprovalFile,
+  type ApprovalRequest,
+} from "./approval-requests.js";
 
 export const APPROVAL_POLICY = "on-request" as const;
 export const APPROVALS_REVIEWER = "user" as const;
@@ -267,13 +277,6 @@ export type TaskErrorCode =
   | "SESSION_INCOMPATIBLE"
   | "REFERENCE_IMAGE_INVALID";
 
-const APPROVAL_METHODS = new Set([
-  "item/commandExecution/requestApproval",
-  "item/fileChange/requestApproval",
-  "item/permissions/requestApproval",
-  "applyPatchApproval",
-  "execCommandApproval",
-]);
 
 /** Fixed, coarse request kinds. Raw request params are never inspected or returned. */
 export function requestKind(method: string): string {
@@ -347,6 +350,12 @@ export interface RunOptions {
   onImage?: (savedPath: string) => void;
   /** Receives a getter for the live run state (progress, timing, the native thread id for salvage). */
   onState?: (get: () => TurnRunState) => void;
+  /**
+   * Decides approval requests of this run's thread and turn (ask / bypass
+   * mode). The turn's deadline is paused while a decision is pending. Without
+   * it every approval request fails the job with APPROVAL_REQUIRED (deny mode).
+   */
+  approvals?: (request: ApprovalRequest) => Promise<ApprovalDecision>;
   /** Bridge-owned image thread (codex_image_generate with native instructions). */
   image?: ImageThreadOptions;
   /**
@@ -560,6 +569,24 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     fail(new TaskError(APPROVAL_METHODS.has(method) ? "APPROVAL_REQUIRED" : "UNSUPPORTED_SERVER_REQUEST", kind));
   });
 
+  // Files announced by fileChange items, so a file-change approval can name them (bounded).
+  const fileChanges = new Map<string, { files: ApprovalFile[]; truncated: boolean }>();
+  const decide = opts.approvals;
+  if (decide) {
+    client.answerServerRequests(APPROVAL_METHODS, async (method, params) => {
+      // Only requests of this run's own thread and turn; anything else is denied.
+      if (pendingFailure || !approvalInScope(method, params, threadId, turnId)) return null;
+      const request = summarizeApproval(method, params, (id) => fileChanges.get(id));
+      if (!request) return null;
+      pauseDeadline();
+      try {
+        return { result: approvalResponse(method, params, await decide(request)) };
+      } finally {
+        resumeDeadline();
+      }
+    });
+  }
+
   client.onClose((kind) => fail(fromClientError(new CodexClientError(kind), phase)));
 
   /** Target accumulator of a turn-scoped event, or undefined when it must be ignored. */
@@ -591,6 +618,10 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
       const now = Date.now();
       lastEventAt = now;
       if (firstModelEventMs === null && isModelEvent(method, obj(p.item))) firstModelEventMs = now - turnStartedAt;
+    }
+    if ((method === "item/started" || method === "item/updated") && obj(p.item)?.type === "fileChange") {
+      const item = obj(p.item)!;
+      if (typeof item.id === "string" && (fileChanges.size < 64 || fileChanges.has(item.id))) fileChanges.set(item.id, fileChangesOf(item));
     }
     if (method === "item/completed") {
       const item = obj(p.item);
@@ -647,7 +678,23 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
   failure.catch(() => undefined);
   if (pendingFailure) failWith?.(pendingFailure);
 
-  const deadline = setTimeout(() => fail(new TaskError("TIMEOUT")), opts.timeoutMs);
+  // The turn's own deadline; paused while an approval decision is pending.
+  let deadlineLeft = opts.timeoutMs;
+  let deadlineSince = Date.now();
+  let paused = 0;
+  const onDeadline = (): void => fail(new TaskError("TIMEOUT"));
+  let deadline: NodeJS.Timeout | undefined = setTimeout(onDeadline, opts.timeoutMs);
+  function pauseDeadline(): void {
+    if (paused++ > 0 || deadline === undefined) return;
+    clearTimeout(deadline);
+    deadline = undefined;
+    deadlineLeft -= Date.now() - deadlineSince;
+  }
+  function resumeDeadline(): void {
+    if (--paused > 0 || pendingFailure) return;
+    deadlineSince = Date.now();
+    deadline = setTimeout(onDeadline, Math.max(0, deadlineLeft));
+  }
   // The job deadline aborts with reason "TIMEOUT"; anything else is a cancel.
   const onAbort = (): void => fail(new TaskError(opts.signal.reason === "TIMEOUT" ? "TIMEOUT" : "CANCELLED"));
   opts.signal.addEventListener("abort", onAbort, { once: true });

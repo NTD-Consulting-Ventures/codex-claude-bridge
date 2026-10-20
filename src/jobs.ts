@@ -75,6 +75,14 @@ interface Job {
   onSettle: ((state: Exclude<JobState, "running" | "queued">) => void) | undefined;
   wallMs: number;
   progress: (() => JobProgress) | undefined;
+  /** Running deadline; undefined while paused or settled. */
+  deadline: NodeJS.Timeout | undefined;
+  deadlineLeft: number;
+  deadlineSince: number;
+  /** Nested pause count (a pending approval decision pauses the wall clock). */
+  paused: number;
+  /** Callers of wait() to wake on a notable change (an approval became pending). */
+  waiters: Set<() => void>;
 }
 
 export type AbortCode = Extract<TaskErrorCode, "TIMEOUT" | "CANCELLED">;
@@ -179,6 +187,11 @@ export class JobManager {
       onSettle,
       wallMs,
       progress: undefined,
+      deadline: undefined,
+      deadlineLeft: wallMs,
+      deadlineSince: 0,
+      paused: 0,
+      waiters: new Set(),
     };
     this.jobs.set(job.view.job_id, job);
     if (busy) {
@@ -198,7 +211,8 @@ export class JobManager {
     const cleanups: (() => Promise<void>)[] = [];
     const own = (c: () => Promise<void>): void => void cleanups.push(c);
     const progress = (get: () => JobProgress): void => void (job.progress = get);
-    const deadline = setTimeout(() => controller.abort("TIMEOUT"), job.wallMs);
+    job.deadlineSince = Date.now();
+    job.deadline = setTimeout(() => controller.abort("TIMEOUT"), job.wallMs);
     job.settled = (async () => {
       let ok = false;
       let result: unknown = null;
@@ -210,7 +224,8 @@ export class JobManager {
         error = e;
       }
       job.runnerDone = true;
-      clearTimeout(deadline);
+      clearTimeout(job.deadline);
+      job.deadline = undefined;
       // An abort observed before settlement (accepted cancel or deadline) wins, unless the
       // runner had already determined its own failure before the abort (e.g. during salvage).
       const decided = error instanceof TaskError && error.decided === true;
@@ -286,26 +301,58 @@ export class JobManager {
   }
 
   /**
-   * Resolves once the job is finished or `ms` have passed (or `signal` aborts).
-   * Returns the current view, or undefined for an unknown job.
+   * Resolves once the job is finished, `ms` have passed, wake() is called for
+   * it (e.g. an approval became pending) or `signal` aborts. Returns the
+   * current view, or undefined for an unknown job.
    */
   async wait(id: string, ms: number, signal?: AbortSignal): Promise<JobView | undefined> {
     const j = this.jobs.get(id);
     if (!j) return undefined;
     if (j.view.state !== "running" && j.view.state !== "queued") return this.view(j);
     let timer: NodeJS.Timeout | undefined;
-    let onAbort: (() => void) | undefined;
+    let wakeUp: (() => void) | undefined;
     await Promise.race([
       j.done,
       new Promise<void>((r) => {
-        timer = setTimeout(r, ms);
-        onAbort = r;
-        signal?.addEventListener("abort", onAbort, { once: true });
+        const w = (): void => r();
+        timer = setTimeout(w, ms);
+        wakeUp = w;
+        j.waiters.add(w);
+        signal?.addEventListener("abort", w, { once: true });
       }),
     ]);
     clearTimeout(timer);
-    if (onAbort) signal?.removeEventListener("abort", onAbort);
+    if (wakeUp) {
+      j.waiters.delete(wakeUp);
+      signal?.removeEventListener("abort", wakeUp);
+    }
     return this.view(j);
+  }
+
+  /**
+   * Pauses a running job's wall-clock deadline (nested), e.g. while an approval
+   * decision is pending; resumeDeadline() continues it with the time left.
+   */
+  pauseDeadline(id: string): void {
+    const j = this.jobs.get(id);
+    if (!j || j.view.state !== "running" || j.paused++ > 0 || j.deadline === undefined) return;
+    clearTimeout(j.deadline);
+    j.deadline = undefined;
+    j.deadlineLeft -= Date.now() - j.deadlineSince;
+  }
+
+  resumeDeadline(id: string): void {
+    const j = this.jobs.get(id);
+    if (!j || j.paused === 0 || --j.paused > 0 || j.runnerDone || j.controller.signal.aborted) return;
+    j.deadlineSince = Date.now();
+    j.deadline = setTimeout(() => j.controller.abort("TIMEOUT"), Math.max(0, j.deadlineLeft));
+  }
+
+  /** Wakes callers of wait() for this job without it having finished. */
+  wake(id: string): void {
+    const j = this.jobs.get(id);
+    if (!j) return;
+    for (const w of [...j.waiters]) w();
   }
 
   /** The most recently finished retained job matching `pred`. */

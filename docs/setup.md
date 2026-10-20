@@ -250,7 +250,7 @@ folder, your sign-ins or the clone.
 
 ## Package names
 
-The package is `codex-claude-bridge` (version 0.3.0, not published to npm). The MCP
+The package is `codex-claude-bridge` (version 0.4.0, not published to npm). The MCP
 protocol name is `codex-claude-bridge` and new registrations use that server ID; older
 registrations named `codex-image-mcp` keep working unchanged. Both bin names,
 `codex-claude-bridge` and the legacy alias `codex-image-mcp`, start the same server. The
