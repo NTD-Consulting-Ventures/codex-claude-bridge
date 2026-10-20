@@ -32,9 +32,16 @@
   a usable saved file, or the file did not verify as a PNG/JPEG under the Codex home. The
   job failed; the images that did verify are listed in `partial_files`, nothing
   unverified was kept.
-- **`APPROVAL_REQUIRED`.** The task needed a permission this bridge will not grant
-  (writing outside `cwd`, network, escalation). Run it yourself in your own Codex
-  session if appropriate. Don't work around it with bypass flags or config overrides.
+- **A job is `awaiting_approval`.** Codex asked for something outside the sandbox. Approve
+  or decline it in the Claude Code dialog, or answer `pending_approvals` with
+  `codex_task_approve`. Unanswered, it is declined after 10 minutes and the turn
+  continues ([approvals](approvals.md)).
+- **`APPROVAL_REQUIRED`.** The job ran in `deny` mode (configured, or `approval_mode:
+  "deny"`) and Codex asked for a permission (writing outside `cwd`, network, escalation).
+  Run it in `ask` mode to decide yourself. Don't work around it with Codex bypass flags or
+  config overrides. If `codex_status` shows `approvals.env_issue: "invalid"`, your
+  `CODEX_APPROVAL_MODE` value is not one of `ask`, `bypass`, `deny` and the bridge fell back
+  to `deny`.
 - **`POLICY_MISMATCH`.** Codex reported a thread policy different from the requested one
   (e.g. an extra writable root or network from your Codex config). The prompt was not
   sent. Check your Codex config for sandbox overrides.

@@ -1030,7 +1030,7 @@ test("MCP tools/list: the image tool advertises session_handle and fresh_session
   const client = new Client({ name: "t", version: "0" });
   await client.connect(ct);
   const tool = (await client.listTools()).tools.find((t) => t.name === "codex_image_generate")!;
-  assert.deepEqual(Object.keys(tool.inputSchema.properties!).sort(), ["aspect", "cwd", "fresh_session", "prompt", "queue", "reference_images", "session_handle", "timeout_s"]);
+  assert.deepEqual(Object.keys(tool.inputSchema.properties!).sort(), ["approval_mode", "aspect", "cwd", "fresh_session", "prompt", "queue", "reference_images", "session_handle", "timeout_s"]);
   assert.deepEqual(tool.inputSchema.required, ["prompt", "cwd"]);
   assert.match(tool.description!, /ONLY|only the requested change/);
   assert.match(tool.description!, /unrelated image, omit session_handle/);

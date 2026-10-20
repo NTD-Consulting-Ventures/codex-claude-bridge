@@ -15,7 +15,7 @@ const MAX_LISTED = 100;
 const MCP_PAGE_LIMIT = 50;
 const MAX_MCP_PAGES = 4;
 const MAX_CURSOR_CHARS = 1024;
-export const SERVER_VERSION = "0.3.0";
+export const SERVER_VERSION = "0.4.0";
 
 export interface VersionProbeResult {
   ok: boolean;
@@ -372,7 +372,8 @@ export async function getStatus(
       "Trusted-local capability, not a security boundary: delegated prompts run as a general Codex agent " +
       "with the user's normal Codex config, plugins, hooks and MCP servers, under the native workspace-write " +
       "sandbox (writable root = task cwd only, no network, /tmp and $TMPDIR excluded) and on-request approvals. " +
-      "Writes inside cwd need no approval; elevated approval requests are denied and fail the job with " +
+      "Writes inside cwd need no approval; elevated approval requests follow the approval mode (see approvals): " +
+      "ask pauses the job until the user decides in Claude Code, bypass accepts them, deny fails the job with " +
       "APPROVAL_REQUIRED. Plugins, hooks and MCP servers may act outside the sandbox.",
   };
 }

@@ -86,15 +86,15 @@ test("prepareOwnedRoot rejects symlink roots/ancestors BEFORE creating anything,
   for (const bad of ["/", "rel", "/a/../b", "/a\0b"]) await assert.rejects(prepareOwnedRoot(bad), PathSecurityError, bad);
 });
 
-test("version 0.3.0 is synchronized across package.json, package-lock.json and SERVER_VERSION; names kept", () => {
+test("version 0.4.0 is synchronized across package.json, package-lock.json and SERVER_VERSION; names kept", () => {
   // Compiled to dist/test/*.js, so the repo root is two levels up.
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
   const pkg = JSON.parse(readFileSync(path.join(root, "package.json"), "utf8"));
   const lock = JSON.parse(readFileSync(path.join(root, "package-lock.json"), "utf8"));
-  assert.equal(SERVER_VERSION, "0.3.0");
-  assert.equal(pkg.version, "0.3.0");
-  assert.equal(lock.version, "0.3.0");
-  assert.equal(lock.packages[""].version, "0.3.0");
+  assert.equal(SERVER_VERSION, "0.4.0");
+  assert.equal(pkg.version, "0.4.0");
+  assert.equal(lock.version, "0.4.0");
+  assert.equal(lock.packages[""].version, "0.4.0");
   assert.equal(pkg.name, "codex-claude-bridge");
   assert.equal(lock.name, "codex-claude-bridge");
   assert.deepEqual(pkg.bin, { "codex-claude-bridge": "dist/src/server.js", "codex-image-mcp": "dist/src/server.js" });

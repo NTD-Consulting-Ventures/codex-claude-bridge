@@ -4,6 +4,8 @@
 
 import { BRIDGE_MODE_ENV, BRIDGE_MODE_INVALID_MESSAGE, isBridgeMode, resolveBridgeMode, type BridgeMode } from "./bridge-mode.js";
 import { isJobTimeout, JOB_TIMEOUT_ENV, JOB_TIMEOUT_INVALID_MESSAGE } from "./limits.js";
+import { APPROVAL_MODE_ENV, APPROVAL_MODE_INVALID_MESSAGE, isApprovalMode, type ApprovalMode } from "./approvals.js";
+export { resolveRegisteredApprovalMode } from "./approvals.js";
 import { resolveOutputRoot } from "./output-root.js";
 export { resolveRegisteredJobTimeout } from "./limits.js";
 
@@ -44,20 +46,31 @@ export function resolveRegisteredBridgeMode(env: NodeJS.ProcessEnv): ModeChoice 
 
 /**
  * Env persisted into the registration: always the validated absolute Codex
- * path and output root; CODEX_BRIDGE_MODE only when a mode is passed, and
- * CODEX_TASK_WALL_SECONDS only when a job timeout is passed (src/limits.ts).
+ * path and output root; CODEX_BRIDGE_MODE only when a mode is passed,
+ * CODEX_TASK_WALL_SECONDS only when a job timeout is passed (src/limits.ts),
+ * and CODEX_APPROVAL_MODE only when an approval mode is passed (src/approvals.ts).
  */
-export function registrationEnv(codex: string, outputRoot: string, mode?: BridgeMode, timeoutS?: number): Record<string, string> {
+export function registrationEnv(codex: string, outputRoot: string, mode?: BridgeMode, timeoutS?: number, approvals?: ApprovalMode): Record<string, string> {
   if (mode !== undefined && !isBridgeMode(mode)) throw new TypeError(BRIDGE_MODE_INVALID_MESSAGE);
   if (timeoutS !== undefined && !isJobTimeout(timeoutS)) throw new TypeError(JOB_TIMEOUT_INVALID_MESSAGE);
+  if (approvals !== undefined && !isApprovalMode(approvals)) throw new TypeError(APPROVAL_MODE_INVALID_MESSAGE);
   const env: Record<string, string> = { CODEX_BIN: codex, CODEX_IMAGE_OUTPUT_ROOT: outputRoot };
   if (mode !== undefined) env[BRIDGE_MODE_ENV] = mode;
   if (timeoutS !== undefined) env[JOB_TIMEOUT_ENV] = String(timeoutS);
+  if (approvals !== undefined) env[APPROVAL_MODE_ENV] = approvals;
   return env;
 }
 
-export function addArgs(node: string, serverJs: string, codex: string, outputRoot: string, mode?: BridgeMode, timeoutS?: number): string[] {
-  const env = Object.entries(registrationEnv(codex, outputRoot, mode, timeoutS)).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
+export function addArgs(
+  node: string,
+  serverJs: string,
+  codex: string,
+  outputRoot: string,
+  mode?: BridgeMode,
+  timeoutS?: number,
+  approvals?: ApprovalMode,
+): string[] {
+  const env = Object.entries(registrationEnv(codex, outputRoot, mode, timeoutS, approvals)).flatMap(([k, v]) => ["-e", `${k}=${v}`]);
   // Name must precede -e: claude 2.1.293 parses -e as variadic, so a name placed
   // after the last -e is swallowed as another env entry.
   return ["mcp", "add", "--transport", "stdio", "--scope", "user", SERVER_NAME, ...env, "--", node, serverJs];
@@ -214,7 +227,7 @@ export function verifyReadback(p: ProbeResult, exp: ExpectedRegistration, name: 
     const want = Object.entries(exp.env).sort();
     const got = Object.entries(env).sort();
     if (JSON.stringify(want) !== JSON.stringify(got)) {
-      problems.push("environment: entries differ from the requested CODEX_BIN / CODEX_IMAGE_OUTPUT_ROOT / CODEX_BRIDGE_MODE / CODEX_TASK_WALL_SECONDS");
+      problems.push("environment: entries differ from the requested CODEX_BIN / CODEX_IMAGE_OUTPUT_ROOT / CODEX_BRIDGE_MODE / CODEX_TASK_WALL_SECONDS / CODEX_APPROVAL_MODE");
     }
     if (exp.env[BRIDGE_MODE_ENV] !== env[BRIDGE_MODE_ENV]) {
       problems.push(`environment: ${BRIDGE_MODE_ENV} is not the requested ${exp.env[BRIDGE_MODE_ENV] ?? "(unset)"}`);

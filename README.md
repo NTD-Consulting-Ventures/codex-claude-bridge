@@ -66,7 +66,9 @@ the folder and pass them as `reference_images` to `codex_image_generate`. See
 ## Limits
 
 - Codex runs with `workspace-write`: it can write only inside `cwd`, with no network.
-  Anything needing approval stops the job with `APPROVAL_REQUIRED`; nothing is approved for you.
+  Anything needing approval pauses the job until you approve or decline it in Claude Code
+  (the default `ask` mode); `bypass` approves automatically and `deny` fails the job
+  instead ([approvals](docs/approvals.md)).
 - Codex still uses your normal config, plugins and MCP servers. This is a trusted-local
   convenience, not a security boundary.
 - One running job at a time (`queue: true` queues up to 8), 300 s by default (`timeout_s`
@@ -80,6 +82,7 @@ the folder and pass them as `reference_images` to `codex_image_generate`. See
 
 - [Setup details, discovery, updating, manual fallback and uninstall](docs/setup.md)
 - [Image-only mode: setup, existing entries and limits](docs/image-only.md)
+- [Approvals: ask in Claude Code, bypass or deny](docs/approvals.md)
 - [Best practices for image series: references, timeouts, partial results](docs/image-series.md)
 - [Image sessions: follow-up edits with an explicit `session_handle`](docs/image-sessions.md)
 - [Security model, tools and protocol](docs/reference.md)

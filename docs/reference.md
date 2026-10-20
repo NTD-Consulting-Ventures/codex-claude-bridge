@@ -20,11 +20,16 @@
 - No bypass/dangerous flags and no `--config` overrides. The server never reads
   `auth.json`/`config.toml`, never logs in, never extracts tokens and never falls back to
   an API key.
-- **Approvals are not bridged.** Any approval request (command, file change,
-  permissions), MCP elicitation, user-input request, dynamic tool call or auth refresh is
-  denied; the turn is interrupted, the process terminated, and the job fails with a typed
-  error such as `APPROVAL_REQUIRED` plus a coarse `request_kind`. Writes inside `cwd`
-  need no approval.
+- **Approvals follow the approval mode** ([approvals.md](approvals.md)). Approval requests
+  (command, file change, permissions) of the job's own thread and turn are, depending on
+  `CODEX_APPROVAL_MODE`: paused until you decide in Claude Code (`ask`, the default),
+  accepted automatically (`bypass`, opt-in), or denied so the job fails with
+  `APPROVAL_REQUIRED` (`deny`). Only one-time, turn-scoped decisions are sent; no session
+  approvals, no policy amendments. Every other server-initiated request (MCP elicitation
+  from Codex's MCP servers, user-input request, dynamic tool call, auth refresh) is still
+  denied: the turn is interrupted, the process terminated, and the job fails with
+  `UNSUPPORTED_SERVER_REQUEST` plus a coarse `request_kind`. Writes inside `cwd` need no
+  approval.
 - Result text is Codex output and may contain sensitive material from your workspace.
 
 ## Image saving
@@ -95,12 +100,13 @@ only.
 
 | tool | input | notes |
 |---|---|---|
-| `codex_status` | `{}` | CLI version, launch policy, plugin and MCP server names (bounded, sanitized; the last good listing is shown with `stale: true` and `cached_at` when a later probe fails), `image_generate_enabled`, `image_output: {root, source: "default"\|"env", error}`, `runtime: {codex_bin, codex_bin_source, codex_launcher: "native"\|"node_shebang"\|"other_script"\|"unknown"\|"missing"\|"invalid", node_path, node_version, node_dir_on_child_path}`, `limits`, `active_job_id`, `queued_job_ids`, `last_job: {job_id, kind, state, finished_at, error_code, likely_cause, partial_files}`, `reference_images: {support, max_count, max_bytes_each, max_total_bytes}`, `image_sessions`. The listing runs under one 10 s budget in parallel with the 5 s version check. |
-| `codex_task_start` | `{prompt, cwd, timeout_s?, queue?, reference_images?}` | `cwd`: absolute, normalized, existing directory, no symlinks, not `/`, `$HOME` or an ancestor. Returns `job_id`, `state` (`running` or `queued`), `timeout_s`. Succeeded result: `{text, text_truncated, image_items, files: [{path, mime_type, bytes, sha256, index, width, height, has_alpha}]}`; `files` is `[]` when no image was produced. |
-| `codex_task_status` | `{job_id}` | `queued` / `running` / `succeeded` / `failed` / `cancelled`; `timeout_s`; while running `progress: {phase, images_completed, files_so_far, first_model_event_ms, last_event_at}`; while queued `queue_position`; when finished the result or a typed error plus `partial_files`. |
-| `codex_task_wait` | `{job_id, max_wait_s?}` | Waits up to `max_wait_s` (1–120, default 30) for the job to finish, then returns the same view as `codex_task_status` plus `waited_ms`. |
+| `codex_status` | `{}` | CLI version, launch policy, plugin and MCP server names (bounded, sanitized; the last good listing is shown with `stale: true` and `cached_at` when a later probe fails), `image_generate_enabled`, `image_output: {root, source: "default"\|"env", error}`, `runtime: {codex_bin, codex_bin_source, codex_launcher: "native"\|"node_shebang"\|"other_script"\|"unknown"\|"missing"\|"invalid", node_path, node_version, node_dir_on_child_path}`, `limits`, `active_job_id`, `queued_job_ids`, `last_job: {job_id, kind, state, finished_at, error_code, likely_cause, partial_files}`, `approvals: {mode, source, env_issue, timeout_s, claude_code_dialog}`, `reference_images: {support, max_count, max_bytes_each, max_total_bytes}`, `image_sessions`. The listing runs under one 10 s budget in parallel with the 5 s version check. |
+| `codex_task_start` | `{prompt, cwd, timeout_s?, queue?, reference_images?, approval_mode?}` | `cwd`: absolute, normalized, existing directory, no symlinks, not `/`, `$HOME` or an ancestor. Returns `job_id`, `state` (`running` or `queued`), `timeout_s`. Succeeded result: `{text, text_truncated, image_items, files: [{path, mime_type, bytes, sha256, index, width, height, has_alpha}]}`; `files` is `[]` when no image was produced. |
+| `codex_task_status` | `{job_id}` | `queued` / `running` / `awaiting_approval` / `succeeded` / `failed` / `cancelled`; `timeout_s`; while running `progress: {phase, images_completed, files_so_far, first_model_event_ms, last_event_at}`; while awaiting approval `pending_approvals`; while queued `queue_position`; `approvals` (newest 10 decision records) and `approvals_total` once there was a request; when finished the result or a typed error plus `partial_files`. |
+| `codex_task_approve` | `{job_id, approval_id, decision: "accept" \| "decline", request_summary}` | Answers one pending approval request; `request_summary` must equal the request's `summary` (`APPROVAL_SUMMARY_MISMATCH` otherwise). Marked `anthropic/requiresUserInteraction`, so Claude Code asks the user to confirm every call. `APPROVAL_NOT_PENDING` when it was already decided, timed out or is unknown. |
+| `codex_task_wait` | `{job_id, max_wait_s?}` | Waits up to `max_wait_s` (1–120, default 30) for the job to finish or to need an approval, then returns the same view as `codex_task_status` plus `waited_ms`. With Claude Code dialog support it opens the approval dialog of a pending request and stays open until it is answered. |
 | `codex_task_cancel` | `{job_id}` | A queued job is cancelled at once; a running one has its turn interrupted and its process killed. Already generated images are kept (`partial_files`). |
-| `codex_image_generate` | `{prompt, cwd, session_handle?, fresh_session?, aspect?, timeout_s?, queue?, reference_images?}` | Asks Codex for one native image. Succeeded result: `{job_id, files: [...], codex_version, session_handle, session}`. A text-only completion is `NO_IMAGE_PRODUCED`. `aspect` (`1:1`, `4:3`, `3:2`, `16:9`, `2:1`, `3:4`, `2:3`, `9:16`, `1:2`) appends a fixed "Output format: …" line to the prompt; the native tool still picks the pixel size. Follow-up edits via an explicit bridge-issued `session_handle` ([image sessions](image-sessions.md)), or a fresh job with the earlier file in `reference_images`. `queue` cannot be combined with `session_handle`. |
+| `codex_image_generate` | `{prompt, cwd, session_handle?, fresh_session?, aspect?, timeout_s?, queue?, reference_images?, approval_mode?}` | Asks Codex for one native image. Succeeded result: `{job_id, files: [...], codex_version, session_handle, session}`. A text-only completion is `NO_IMAGE_PRODUCED`. `aspect` (`1:1`, `4:3`, `3:2`, `16:9`, `2:1`, `3:4`, `2:3`, `9:16`, `1:2`) appends a fixed "Output format: …" line to the prompt; the native tool still picks the pixel size. Follow-up edits via an explicit bridge-issued `session_handle` ([image sessions](image-sessions.md)), or a fresh job with the earlier file in `reference_images`. `queue` cannot be combined with `session_handle`. |
 
 Limits: 300 s per job by default (`CODEX_TASK_WALL_SECONDS`, capped at 900; per job
 `timeout_s` 10–900), one running job plus up to 8 queued (opt-in `queue: true`, otherwise
@@ -116,7 +122,7 @@ Error codes: `APPROVAL_REQUIRED`, `UNSUPPORTED_SERVER_REQUEST`, `AUTH_REQUIRED`,
 `NO_IMAGE_PRODUCED`, `IMAGE_ITEM_INVALID`, `IMAGE_VERIFICATION_FAILED`,
 `OUTPUT_ROOT_INVALID`, `OUTPUT_ROOT_UNAVAILABLE`, `REFERENCE_IMAGE_INVALID` (a queued
 job's references changed before it started). Tool-call errors: `INVALID_ARGUMENTS`,
-`INVALID_CWD`, `BUSY`, `QUEUE_FULL`, `REFERENCE_IMAGE_INVALID`,
+`INVALID_CWD`, `BUSY`, `QUEUE_FULL`, `REFERENCE_IMAGE_INVALID`, `APPROVAL_NOT_PENDING`, `APPROVAL_SUMMARY_MISMATCH`,
 `REFERENCE_IMAGES_UNSUPPORTED`, `UNKNOWN_JOB`, `UNKNOWN_TOOL`, `TOOL_DISABLED` (a tool not
 exposed in the current `CODEX_BRIDGE_MODE`), `SHUTTING_DOWN` (the server is stopping;
 no job was started and no job ID exists).
@@ -155,8 +161,8 @@ to the first `item/*` event other than the echoed user message; `null` if none),
 
 `CODEX_BRIDGE_MODE` (unset = `general`, or `image-only`) is resolved once at server
 start and reported by `codex_status` as `bridge_mode`. `image-only` lists only
-`codex_status`, `codex_image_generate`, `codex_task_status`, `codex_task_wait` and
-`codex_task_cancel`, and
+`codex_status`, `codex_image_generate`, `codex_task_status`, `codex_task_wait`,
+`codex_task_approve` and `codex_task_cancel`, and
 refuses direct `codex_task_start` calls with `TOOL_DISABLED`; it narrows the MCP tool
 surface only and does not change native Codex capabilities or the launch policy above. See
 [image-only.md](image-only.md).

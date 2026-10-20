@@ -50,8 +50,8 @@ program once, in your Terminal, and **stores absolute paths** in the registratio
 It then runs `--version` on both (bounded, output checked) and stops if that fails.
 Registered: `CODEX_BIN=<absolute codex>`, `CODEX_IMAGE_OUTPUT_ROOT=<absolute folder>`,
 the absolute current Node (`process.execPath`) and the absolute `dist/src/server.js`;
-`CODEX_BRIDGE_MODE` and `CODEX_TASK_WALL_SECONDS` only when you set them
-([job timeout](#job-timeout)).
+`CODEX_BRIDGE_MODE`, `CODEX_TASK_WALL_SECONDS` and `CODEX_APPROVAL_MODE` only when you set
+them ([job timeout](#job-timeout), [approval mode](#approval-mode)).
 
 npm installs of Codex and Claude are small Node scripts (`#!/usr/bin/env node`) behind a
 symlink, so they need `node` on `PATH`. Every Codex, Claude and npm process started by
@@ -190,6 +190,22 @@ the entry as described in [Updating](#updating), with the extra
 `-e "CODEX_TASK_WALL_SECONDS=600"`. Image series: see
 [best practices](image-series.md).
 
+## Approval mode
+
+When Codex asks for something outside the sandbox, the bridge by default pauses the job
+and asks you in Claude Code (`ask`). To change that for every job, set
+`CODEX_APPROVAL_MODE` when you register:
+
+```sh
+CODEX_APPROVAL_MODE=bypass npm run register -- --apply   # approve every request automatically
+CODEX_APPROVAL_MODE=deny npm run register -- --apply     # fail the job instead (0.3.0 behaviour)
+```
+
+Only `ask`, `bypass` and `deny` are accepted (anything else stops the script with exit 1,
+value not shown); unset stores nothing and the server uses `ask`. To change an existing
+registration, replace it as described in [Updating](#updating) with the extra
+`-e "CODEX_APPROVAL_MODE=bypass"`. Details and risks: [approvals](approvals.md).
+
 ## Updating
 
 Same clone, same path, no re-registration:
@@ -250,7 +266,7 @@ folder, your sign-ins or the clone.
 
 ## Package names
 
-The package is `codex-claude-bridge` (version 0.3.0, not published to npm). The MCP
+The package is `codex-claude-bridge` (version 0.4.0, not published to npm). The MCP
 protocol name is `codex-claude-bridge` and new registrations use that server ID; older
 registrations named `codex-image-mcp` keep working unchanged. Both bin names,
 `codex-claude-bridge` and the legacy alias `codex-image-mcp`, start the same server. The

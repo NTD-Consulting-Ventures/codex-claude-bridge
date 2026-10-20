@@ -68,7 +68,7 @@ test("tool schemas are strict; no model/config/url/command parameters", () => {
     assert.equal(t.inputSchema.additionalProperties, false, t.name);
     const props = Object.keys(t.inputSchema.properties);
     // Only the image tool takes the bridge-issued session handle, the fresh flag and aspect; both job tools take the bounded job options.
-    const jobOpts = ["timeout_s", "queue", "reference_images"];
+    const jobOpts = ["timeout_s", "queue", "reference_images", "approval_mode"];
     const allowed =
       t.name === "codex_image_generate"
         ? ["prompt", "cwd", "session_handle", "fresh_session", "aspect", ...jobOpts]
@@ -76,7 +76,9 @@ test("tool schemas are strict; no model/config/url/command parameters", () => {
           ? ["prompt", "cwd", ...jobOpts]
           : t.name === "codex_task_wait"
             ? ["job_id", "max_wait_s"]
-            : ["job_id"];
+            : t.name === "codex_task_approve"
+              ? ["job_id", "approval_id", "decision", "request_summary"]
+              : ["job_id"];
     for (const p of props) assert.ok(allowed.includes(p), `${t.name}.${p}`);
   }
 });
@@ -93,7 +95,7 @@ test("codex_status with no env reports the default root ~/codex-images as enable
   const s = (await handler().call("codex_status", {})).structuredContent as Record<string, any>;
   assert.equal(s.image_generate_enabled, true);
   assert.deepEqual(s.image_output, { root: path.join(os.homedir(), "codex-images"), source: "default", error: null });
-  assert.equal(s.server_version, "0.3.0");
+  assert.equal(s.server_version, "0.4.0");
   const o = (await handler({ env: { CODEX_IMAGE_OUTPUT_ROOT: "/abs/out" } }).call("codex_status", {})).structuredContent as Record<string, any>;
   assert.deepEqual(o.image_output, { root: "/abs/out", source: "env", error: null });
 });
@@ -247,9 +249,10 @@ test("task job lifecycle: start -> status -> succeeded with text", async () => {
   assert.deepEqual(done.result, { text: "done", text_truncated: false, image_items: 0, files: [] });
 });
 
-test("approval request yields failed job with APPROVAL_REQUIRED and only the request kind", async () => {
+test("deny mode: an approval request yields a failed job with APPROVAL_REQUIRED and only the request kind", async () => {
   const cwd = tmp();
   const h = handler({
+    env: { CODEX_APPROVAL_MODE: "deny" },
     createTransport: () =>
       new FakeAppServer(completingScript([{ id: 9, method: "item/fileChange/requestApproval", params: { threadId: THREAD_ID, turnId: TURN_ID, reason: "SECRET" } }])),
   });
@@ -758,7 +761,7 @@ test("MCP server lists tools over MCP", async () => {
   const client = new Client({ name: "test", version: "0" });
   await client.connect(ct);
   const { tools } = await client.listTools();
-  assert.deepEqual(tools.map((t) => t.name), ["codex_status", "codex_task_start", "codex_task_status", "codex_task_wait", "codex_task_cancel", "codex_image_generate"]);
+  assert.deepEqual(tools.map((t) => t.name), ["codex_status", "codex_task_start", "codex_task_status", "codex_task_wait", "codex_task_approve", "codex_task_cancel", "codex_image_generate"]);
   const res = await client.callTool({ name: "codex_status", arguments: {} });
   assert.equal((res.structuredContent as any).codex_cli_version, "0.156.0");
   await client.close();
@@ -926,8 +929,8 @@ test("launch policy regression: task with images still uses cwd-only workspace-w
 
 // --- Bridge mode (CODEX_BRIDGE_MODE) ---
 
-const GENERAL_TOOLS = ["codex_status", "codex_task_start", "codex_task_status", "codex_task_wait", "codex_task_cancel", "codex_image_generate"];
-const IMAGE_ONLY_TOOLS = ["codex_status", "codex_image_generate", "codex_task_status", "codex_task_wait", "codex_task_cancel"];
+const GENERAL_TOOLS = ["codex_status", "codex_task_start", "codex_task_status", "codex_task_wait", "codex_task_approve", "codex_task_cancel", "codex_image_generate"];
+const IMAGE_ONLY_TOOLS = ["codex_status", "codex_image_generate", "codex_task_status", "codex_task_wait", "codex_task_approve", "codex_task_cancel"];
 const INVALID_MODES = ["", " ", "\t", "\n", "Image-Only", "IMAGE-ONLY", "image_only", "imageonly", " image-only", "image-only ", "general\n", "GENERAL", "task", "SECRET-mode"];
 const code = (r: ToolResult): string => (r.structuredContent as any).error.code;
 const jobCount = (h: ToolHandler): number => (h.jobs as any).jobs.size;
@@ -944,7 +947,7 @@ test("bridge mode resolver: unset is general; only exact general|image-only acce
   }
 });
 
-test("tool discovery: unset and general list the six definitions unchanged; image-only exactly five", () => {
+test("tool discovery: unset and general list the seven definitions unchanged; image-only exactly six", () => {
   for (const env of [{}, { CODEX_BRIDGE_MODE: "general" }]) {
     const tools = handler({ env }).listTools();
     assert.deepEqual(tools.map((t) => t.name), GENERAL_TOOLS);
@@ -956,11 +959,11 @@ test("tool discovery: unset and general list the six definitions unchanged; imag
   assert.ok(Object.isFrozen(MODE_TOOLS) && Object.isFrozen(MODE_TOOLS.general) && Object.isFrozen(MODE_TOOLS["image-only"]));
 });
 
-test("codex_status reports bridge_mode and 0.3.0 in every mode; default and custom roots unchanged", async () => {
+test("codex_status reports bridge_mode and 0.4.0 in every mode; default and custom roots unchanged", async () => {
   for (const [env, mode] of [[{}, "general"], [{ CODEX_BRIDGE_MODE: "general" }, "general"], [IMAGE_ONLY, "image-only"]] as const) {
     const s = (await handler({ env }).call("codex_status", {})).structuredContent as Record<string, any>;
     assert.equal(s.bridge_mode, mode);
-    assert.equal(s.server_version, "0.3.0");
+    assert.equal(s.server_version, "0.4.0");
     assert.equal(s.active_job_id, null);
     assert.equal(s.launch.sandbox, "workspace-write");
     assert.equal(s.launch.approval_policy, "on-request");
@@ -1042,7 +1045,7 @@ test("private start re-checks the name at runtime: hidden kind TOOL_DISABLED, un
   }
 });
 
-test("MCP protocol (image-only): tools/list has five tools; hidden and unknown calls refused with no job and no spawn", async () => {
+test("MCP protocol (image-only): tools/list has six tools; hidden and unknown calls refused with no job and no spawn", async () => {
   let spawned = 0;
   const [ct, st] = InMemoryTransport.createLinkedPair();
   const { server, handler: h } = buildServer({ versionProbe: okProbe, capabilityProbe: caps, env: { ...IMAGE_ONLY }, createTransport: () => (spawned++, new FakeAppServer()) });
@@ -1119,7 +1122,7 @@ test("server CLI: invalid CODEX_BRIDGE_MODE exits before any transport with a st
   }
 });
 
-test("server CLI (image-only) over real stdio: tools/list has five tools, codex_task_start is TOOL_DISABLED", { timeout: 20_000 }, async () => {
+test("server CLI (image-only) over real stdio: tools/list has six tools, codex_task_start is TOOL_DISABLED", { timeout: 20_000 }, async () => {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverJs],
