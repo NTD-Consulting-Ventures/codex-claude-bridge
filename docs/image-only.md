@@ -1,14 +1,15 @@
 # Image-only mode (opt-in)
 
-By default the bridge lists six tools. With `CODEX_BRIDGE_MODE=image-only` in the
+By default the bridge lists seven tools. With `CODEX_BRIDGE_MODE=image-only` in the
 environment the server is started with (preferably stored in its registration; see
-[Where the mode comes from](#where-the-mode-comes-from)) it lists only these five,
+[Where the mode comes from](#where-the-mode-comes-from)) it lists only these six,
 unchanged:
 
 - `codex_status`
 - `codex_image_generate`
 - `codex_task_status`
 - `codex_task_wait`
+- `codex_task_approve`
 - `codex_task_cancel`
 
 Use it when you want Claude to see only image generation and not general task delegation.
@@ -23,8 +24,8 @@ Use it when you want Claude to see only image generation and not general task de
   login handling.
 - The launch policy is the same as in general mode: `workspace-write` with `cwd` as the
   only writable root, no sandbox network, `/tmp` and `$TMPDIR` excluded, `on-request`
-  approvals. Elevated approval requests are refused and fail the job with
-  `APPROVAL_REQUIRED`; nothing is approved for you. See [reference.md](reference.md).
+  approvals. Elevated approval requests follow the [approval mode](approvals.md), exactly
+  as in general mode. See [reference.md](reference.md).
 - The bridge wraps the description in an instruction to generate exactly one image and
   not to run shell commands, edit files or call other tools. Codex is **asked**, not
   forced. A malicious or careless description can still make Codex run shell commands,
@@ -36,10 +37,10 @@ Use it when you want Claude to see only image generation and not general task de
 
 | | general (default) | image-only |
 |---|---|---|
-| tools listed | all six | the five above |
+| tools listed | all seven | the six above |
 | direct `codex_task_start` call | runs | `TOOL_DISABLED`, before any argument, `cwd` or output-folder check; no job, no Codex process |
 | unknown tool name | `UNKNOWN_TOOL` | `UNKNOWN_TOOL` |
-| `codex_task_status` / `codex_task_wait` / `codex_task_cancel` | any job | image jobs only; other job IDs are `UNKNOWN_JOB` |
+| `codex_task_status` / `codex_task_wait` / `codex_task_approve` / `codex_task_cancel` | any job | image jobs only; other job IDs are `UNKNOWN_JOB` |
 | `codex_status` | `bridge_mode: "general"` | `bridge_mode: "image-only"` |
 
 Image saving (including `partial_files`), the output folder, reference images, timeouts,
@@ -94,7 +95,7 @@ invalid value exits 1 before any CLI is found or run); a valid mode does not aff
 sign-in check, and `--check-auth` never changes MCP config.
 
 Start a new Claude Code session and ask Claude to call `codex_status`; it should report
-`"bridge_mode": "image-only"`, and `/mcp` should show five tools.
+`"bridge_mode": "image-only"`, and `/mcp` should show six tools.
 
 ## Opting an existing registration in
 
