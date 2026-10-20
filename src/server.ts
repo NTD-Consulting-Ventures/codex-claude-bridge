@@ -677,7 +677,12 @@ export class ToolHandler {
     requireImage: boolean,
   ): Promise<{ outcome: TurnOutcome; files: ImageFile[] }> {
     const home = codexHome(this.env);
-    const sink = new ImageSink(root, [home], { checkpoint: () => throwIfAborted(signal), afterStep: this.deps.imageAfterStep });
+    const sink = new ImageSink(root, [home], {
+      checkpoint: () => throwIfAborted(signal),
+      // Shutdown stops all writing, salvage included: the process is about to exit.
+      stop: () => this.closing,
+      afterStep: this.deps.imageAfterStep,
+    });
     let state: (() => TurnRunState) | undefined;
     let saving = false;
     progress(() => {
@@ -701,7 +706,7 @@ export class ToolHandler {
         onState: (get) => void (state = get),
       });
       saving = true;
-      throwIfAborted(signal);
+      throwIfAborted(signal, "saving");
       let paths: string[];
       try {
         paths = nativeSavedPaths(outcome);
@@ -714,16 +719,20 @@ export class ToolHandler {
       }
       for (const p of paths) sink.add(p);
       await sink.drain();
-      throwIfAborted(signal);
+      if (sink.failures > 0) await sink.retryFailed();
+      throwIfAborted(signal, "saving");
       if (sink.rootUnavailable) throw new TaskError("OUTPUT_ROOT_UNAVAILABLE");
       if (sink.failures > 0) throw new TaskError("IMAGE_VERIFICATION_FAILED");
       return { outcome, files: sink.files() };
     } catch (e) {
       const te = e instanceof TaskError ? e : new TaskError("PROTOCOL_ERROR");
+      // A failure determined before any cancel or deadline stays the root cause, even if one arrives during salvage.
+      te.decided = !signal.aborted;
+      if (!this.closing) await sink.salvage();
       if (!this.closing) {
-        await sink.salvage();
         const st = state?.();
-        await sink.salvageThreadFolder(home, st?.threadId ?? null, st?.turnStartedAt ?? null);
+        // A resumed thread's folder also holds the session's earlier images: only files from this turn on.
+        await sink.salvageThreadFolder(home, st?.threadId ?? null, st?.turnStartedAt ?? null, run.image?.resume ? 0 : undefined);
       }
       await sink.finish();
       te.partialFiles = sink.files();
@@ -897,7 +906,11 @@ export class ToolHandler {
         continued = true;
       }
     }
-    if (!session && caps.continuity) session = this.sessions.create(ctx);
+    // A job that will wait in the queue gets its new session only when it starts, so queued
+    // reservations never evict or crowd out the caller's idle sessions.
+    const queuing = this.jobs.active !== undefined;
+    const deferSession = !session && caps.continuity && queuing;
+    if (!session && caps.continuity && !queuing) session = this.sessions.create(ctx);
 
     // Native developer instructions keep the single-image guidance out of the
     // visible user message; without them the prompt wrapper is the fallback.
@@ -916,14 +929,21 @@ export class ToolHandler {
     const sessionMeta = (jobId: string): Pick<ImageResult, "session_handle" | "session"> =>
       session
         ? { session_handle: session.handle, session: { ...this.sessions.view(session, { promptChars: userPrompt.length, jobId }, continued) } }
-        : { session_handle: null, session: { continuity: "unavailable", reason: caps.reason } };
+        : deferSession
+          ? { session_handle: null, session: { continuity: "available", handle_pending: true } }
+          : { session_handle: null, session: { continuity: "unavailable", reason: caps.reason } };
 
     if (session) this.sessions.lease(session);
-    const queued = this.jobs.active !== undefined;
+    const queued = queuing;
     const view = this.jobs.start(
       "image",
       async (signal, timeoutMs, jobId, _own, progress) => {
         jobIdSeen = jobId;
+        if (deferSession) {
+          session = this.sessions.create(ctx);
+          this.sessions.lease(session);
+          this.trackSession(jobId, session.handle);
+        }
         const referenceImages = queued ? await this.revalidate(cwd, o.references) : refs;
         // Every image job, including the prompt-wrapper fallback, reads only its own thread+turn.
         const { files } = await this.runTurnSaving(
@@ -936,7 +956,7 @@ export class ToolHandler {
         );
         try {
           const version = await codexVersion(this.deps.versionProbe ?? versionProbeFor(this.env));
-          throwIfAborted(signal);
+          throwIfAborted(signal, "saving");
           const result: ImageResult = { job_id: jobId, files, codex_version: version, ...sessionMeta(jobId) };
           return result;
         } catch (e) {
@@ -958,11 +978,14 @@ export class ToolHandler {
       if (session) this.sessions.release(session);
       return this.closing ? shuttingDown() : (this.busy(o.queue) ?? err("BUSY", "Another job is active."));
     }
-    if (session) {
-      this.jobSessions.set(view.job_id, session.handle);
-      while (this.jobSessions.size > MAX_JOB_SESSIONS) this.jobSessions.delete(this.jobSessions.keys().next().value!);
-    }
+    if (session) this.trackSession(view.job_id, session.handle);
     return this.startResult(view, refs.length, sessionMeta(view.job_id));
+  }
+
+  /** Image job id -> session handle, for polling metadata (bounded). */
+  private trackSession(jobId: string, handle: string): void {
+    this.jobSessions.set(jobId, handle);
+    while (this.jobSessions.size > MAX_JOB_SESSIONS) this.jobSessions.delete(this.jobSessions.keys().next().value!);
   }
 }
 

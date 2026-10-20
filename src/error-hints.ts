@@ -45,7 +45,11 @@ const POLICY_INFO = new Set(["cyberPolicy", "misalignmentPolicyViolation"]);
 const hint = (retryable: boolean, likely_cause: LikelyCause): ErrorHint => ({ retryable, likely_cause });
 
 function timeoutHint(d: TaskDiagnostic | undefined): ErrorHint {
-  if (d?.phase !== "turn") return hint(true, "startup");
+  // Without a phase the abort hit outside the turn's own bookkeeping: no claim about the cause.
+  if (d?.phase === undefined) return hint(true, "unknown");
+  // The turn had finished; the bridge ran out of time saving or checking (see partial_files).
+  if (d.phase === "saving") return hint(true, "slow_generation");
+  if (d.phase !== "turn") return hint(true, "startup");
   // Codex kept retrying a dropped connection or a failing server until the deadline.
   const info = d.last_retry_error_info;
   const cls = d.last_retry_message_class;

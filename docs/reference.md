@@ -39,17 +39,20 @@
   `has_alpha` from its header. Identical `savedPath`s are copied once. At most 8 images
   per job.
 - **Incremental.** Each completed image is verified and copied as soon as Codex reports
-  it, one at a time; a running job lists the copies in `progress.files_so_far`.
+  it, one at a time; a running job lists the copies in `progress.files_so_far`. A copy that
+  fails is tried once more after the turn (Codex may report an image a moment before its
+  file is complete) before the job is judged.
 - **Partial results.** When a job fails, times out or is cancelled, nothing that was
   verified and completely written is removed. After the failure the bridge also saves
   completed images it had not copied yet (the abort only stops copying while the job is
   still running), and images Codex saved into `generated_images/<thread>/` at or after
   the turn start without reporting them; those are matched by location and time only,
   must be complete (a PNG must end with its IEND chunk) and are labelled
-  `source: "thread_folder"`. All of them are reported as `partial_files` on the failed or
+  `source: "thread_folder"`; for a resumed image thread only files from the turn start on
+  count, so the session's earlier images are not picked up. All of them are reported as `partial_files` on the failed or
   cancelled job (an empty list when there are none). Unverified or partially written
-  files and an empty job directory are removed. Nothing is salvaged while the server is
-  shutting down. The job stays `BUSY` until every filesystem step has finished.
+  files and an empty job directory are removed. Once the server starts shutting down
+  nothing more is written, salvage included. The job stays `BUSY` until every filesystem step has finished.
 - Success still requires every reported image item to verify: an item with no
   `savedPath`, a status other than `completed`, or beyond the 8-item bound fails the job
   with `IMAGE_ITEM_INVALID`; a file that does not verify fails it with
@@ -122,13 +125,16 @@ no job was started and no job ID exists).
 
 Every job error carries `retryable` and `likely_cause`, derived by a fixed mapping
 (`src/error-hints.ts`) from the code and the whitelisted diagnostic enums only. They are
-hints for the caller's decision, not a root cause; the bridge never retries.
+hints for the caller's decision, not a root cause; the bridge never retries. A failure
+that was determined before a cancel or the deadline (for example a policy rejection)
+stays the reported error even if the cancel or deadline arrives while images are still
+being salvaged.
 
 | `likely_cause` | when | `retryable` |
 |---|---|---|
 | `network` | `TURN_FAILED` with a connection error, or a `TIMEOUT` while Codex kept retrying one | true |
 | `server` | server or overload errors (also as the last retried error before a timeout) | true |
-| `slow_generation` | `TIMEOUT` in the turn after images completed or while events still arrived | true |
+| `slow_generation` | `TIMEOUT` in the turn after images completed or while events still arrived, or after the turn finished (`phase: "saving"`) | true |
 | `no_model_response` | `TIMEOUT` in the turn with no model event at all | true |
 | `stalled` | `TIMEOUT` in the turn, last event more than 60 s before the deadline | true |
 | `startup` | timeout or RPC failure before the turn (`initialize`, `thread/start`, `turn/start`) | true |

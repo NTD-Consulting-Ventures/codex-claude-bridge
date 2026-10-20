@@ -2,8 +2,8 @@
 
 ## Release 0.3.0 (image-series resilience)
 
-- Automated checks on the final tree: lint, typecheck, build, `git diff --check`, and 296
-  of 308 fixture tests pass (10 skipped as before). The 2 that fail in the maintainers'
+- Automated checks on the final tree: lint, typecheck, build, `git diff --check`, and 302
+  of 314 fixture tests pass (10 skipped as before). The 2 that fail in the maintainers'
   Linux container fail identically on the unchanged 0.2.3 tree there: they assert that a
   killed schema-generator helper is gone, and that container's PID 1 leaves killed
   orphans as zombies. CI runs the suite on macOS.
@@ -12,7 +12,11 @@
   timeout, `TURN_FAILED` and cancel, thread-folder salvage (complete files only, older
   files ignored, nothing during shutdown), reference-image validation and `localImage`
   turn input, `aspect`, file metadata, error hints, the bounded and cached
-  `codex_status`, and the installer's timeout persistence.
+  `codex_status`, and the installer's timeout persistence. An independent review of the
+  diff found five defects (hints after a late cancel or deadline, no retry of a copy that
+  failed once, queued image jobs reserving sessions at enqueue, salvage continuing during
+  shutdown, the salvage window of resumed threads); all are fixed with regression tests
+  that fail without the fix.
 - **Schema check** with the official codex-cli 0.162.1 npm package: the generated stable
   schema yields continuity available and `localImage` turn input available.
 - **Signed-out protocol check** with the same 0.162.1 package in a Linux container with

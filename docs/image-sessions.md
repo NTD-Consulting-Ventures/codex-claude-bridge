@@ -83,7 +83,9 @@ with `fresh_session: true` and a self-contained description, optionally with the
 file in `reference_images` so the new thread builds on it, is the user's explicit choice
 (for `SESSION_UNKNOWN`, omit the handle instead; `action` is `omit_session_handle`).
 `queue: true` cannot be combined with `session_handle`: wait for the previous job
-(`codex_task_wait`), then continue.
+(`codex_task_wait`), then continue. A queued new image gets its session only when it
+starts: its start response has `session_handle: null` and `session.handle_pending: true`;
+read the handle from `codex_task_status` or the result.
 
 | code | when |
 |---|---|

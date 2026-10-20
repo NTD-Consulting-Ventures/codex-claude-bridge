@@ -152,7 +152,8 @@ export function threadPolicyMismatch(resp: unknown, cwd: string): PolicyMismatch
   return null;
 }
 
-export type Phase = "spawn" | "initialize" | "model_select" | "thread_start" | "thread_name" | "thread_resume" | "turn_start" | "turn";
+/** Lifecycle phase; "saving" is the bridge's own post-turn work (copying images, version check). */
+export type Phase = "spawn" | "initialize" | "model_select" | "thread_start" | "thread_name" | "thread_resume" | "turn_start" | "turn" | "saving";
 
 /** CodexErrorInfo variants (schema v0.156.0). Unknown variants map to "unrecognized". */
 const CODEX_ERROR_INFO = new Set([
@@ -302,6 +303,11 @@ export class TaskError extends Error {
   diagnostic: TaskDiagnostic | undefined;
   /** Verified images saved before the job failed (set by the job runner, reported as partial_files). */
   partialFiles: ImageFile[] | undefined;
+  /**
+   * Set by the job runner when this failure was determined before any cancel
+   * or deadline: a later abort (during salvage) then does not replace it.
+   */
+  decided: boolean | undefined;
   constructor(
     readonly code: TaskErrorCode,
     readonly requestKind?: string,
@@ -424,7 +430,7 @@ function turnErrorCode(s: TurnErrorSummary | undefined): TaskErrorCode {
   return "TURN_FAILED";
 }
 
-const RPC_FAILURE: Record<Exclude<Phase, "spawn" | "turn">, TaskErrorCode> = {
+const RPC_FAILURE: Record<Exclude<Phase, "spawn" | "turn" | "saving">, TaskErrorCode> = {
   initialize: "INITIALIZE_FAILED",
   model_select: "MODEL_UNAVAILABLE",
   thread_start: "THREAD_START_FAILED",
@@ -463,7 +469,7 @@ export function fromClientError(e: unknown, phase: Phase): TaskError {
     case "protocol":
       return new TaskError("PROTOCOL_ERROR", undefined, d);
     default:
-      return new TaskError(phase === "spawn" || phase === "turn" ? "TURN_FAILED" : RPC_FAILURE[phase], undefined, d);
+      return new TaskError(phase === "spawn" || phase === "turn" || phase === "saving" ? "TURN_FAILED" : RPC_FAILURE[phase], undefined, d);
   }
 }
 

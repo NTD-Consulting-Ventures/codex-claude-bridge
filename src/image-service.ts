@@ -281,6 +281,8 @@ const MTIME_SKEW_MS = 2_000;
 export interface SinkHooks {
   /** Throws once the job is aborted: further copies are deferred (salvage() may still save them). */
   checkpoint?: () => void;
+  /** True once nothing more may be written at all (server shutdown); honoured during salvage too. */
+  stop?: () => boolean;
   /** Tests only: awaited AFTER each filesystem step has already completed. */
   afterStep?: CollectHooks["afterStep"];
 }
@@ -339,7 +341,22 @@ export class ImageSink {
     }
   }
 
-  /** After a failure: saves deferred images regardless of the abort, then drains. */
+  /**
+   * Copies once more every image whose copy failed: Codex may report an image
+   * a moment before its file is complete. Called on success before failures
+   * are judged, and by salvage().
+   */
+  async retryFailed(): Promise<void> {
+    await this.drain();
+    for (const p of [...this.failed]) {
+      this.failed.delete(p);
+      const index = this.order.indexOf(p);
+      this.chain = this.chain.then(() => this.copy(p, index));
+    }
+    await this.drain();
+  }
+
+  /** After a failure: saves deferred images regardless of the abort and retries failed copies, then drains. */
   async salvage(): Promise<void> {
     await this.drain();
     this.salvaging = true;
@@ -347,7 +364,7 @@ export class ImageSink {
       const index = this.order.indexOf(p);
       this.chain = this.chain.then(() => this.copy(p, index));
     }
-    await this.drain();
+    await this.retryFailed();
   }
 
   /**
@@ -356,8 +373,8 @@ export class ImageSink {
    * when the turn was cut off). Matched by location and time only, so they
    * are labelled source "thread_folder"; duplicates of saved files are dropped.
    */
-  async salvageThreadFolder(codexHomeDir: string, threadId: string | null, sinceMs: number | null): Promise<void> {
-    if (threadId === null || sinceMs === null || !THREAD_DIR_RE.test(threadId)) return;
+  async salvageThreadFolder(codexHomeDir: string, threadId: string | null, sinceMs: number | null, skewMs: number = MTIME_SKEW_MS): Promise<void> {
+    if (threadId === null || sinceMs === null || !THREAD_DIR_RE.test(threadId) || this.hooks.stop?.()) return;
     const dir = path.join(codexHomeDir, "generated_images", threadId);
     let found: { p: string; mtime: number }[] = [];
     try {
@@ -367,7 +384,7 @@ export class ImageSink {
         if (!e.isFile() || !/\.(png|jpe?g)$/i.test(e.name)) continue;
         const p = path.join(dir, e.name);
         const m = (await fsp.lstat(p)).mtimeMs;
-        if (m >= sinceMs - MTIME_SKEW_MS) found.push({ p, mtime: m });
+        if (m >= sinceMs - skewMs) found.push({ p, mtime: m });
         if (found.length > 64) break;
       }
     } catch {
@@ -412,7 +429,7 @@ export class ImageSink {
   }
 
   private async copy(p: string, index: number): Promise<void> {
-    if (this.saved.has(p) || this.failed.has(p) || this.rootUnavailable) return;
+    if (this.saved.has(p) || this.failed.has(p) || this.rootUnavailable || this.hooks.stop?.()) return;
     if (this.aborted()) {
       if (!this.deferred.includes(p)) this.deferred.push(p);
       return;

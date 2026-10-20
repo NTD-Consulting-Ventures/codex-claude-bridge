@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { errorHint } from "../src/error-hints.js";
-import { imageInfo } from "../src/image-service.js";
+import { ImageSink, imageInfo } from "../src/image-service.js";
 import { registrationEnv, addArgs } from "../src/install.js";
 import { JobManager, MAX_QUEUED_JOBS } from "../src/jobs.js";
 import { JOB_TIMEOUT_INVALID_MESSAGE, resolveJobTimeout, resolveRegisteredJobTimeout } from "../src/limits.js";
@@ -593,4 +593,124 @@ test("the plain text-only task still succeeds with no files and no partial_files
   assert.deepEqual(done.result, { text: "done", text_truncated: false, image_items: 0, files: [] });
   assert.equal(done.partial_files, undefined);
   assert.deepEqual(readdirSync(f.base).sort(), ["codex-home"]);
+});
+
+// ---------------------------------------------------------------- review fixes
+
+function gate(): { entered: Promise<void>; release: () => void; hold: () => Promise<void> } {
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((r) => (enter = r));
+  const released = new Promise<void>((r) => (release = r));
+  return { entered, release, hold: async () => (enter(), await released) };
+}
+
+test("a failure decided before the deadline stays the root cause when the deadline fires during salvage", async () => {
+  const f = fixture();
+  const g = gate();
+  const h = handler(f, {
+    wallMs: 150,
+    imageAfterStep: async (step) => (step === "copy" ? g.hold() : undefined),
+    createTransport: () => scripted([imgItem(f.a, "g1"), turnCompleted("failed", { message: "blocked", codexErrorInfo: "cyberPolicy" })]),
+  });
+  const s = await call(h, "codex_task_start", { prompt: "x", cwd: f.base });
+  await g.entered;
+  await sleep(250);
+  assert.equal(h.jobs.active, s.job_id, "still BUSY while the copy is held past the deadline");
+  g.release();
+  const done = await settle(h, s.job_id);
+  assert.equal(done.error.code, "TURN_FAILED");
+  assert.equal(done.error.likely_cause, "content_policy");
+  assert.equal(done.error.retryable, false);
+  assert.equal(done.partial_files.length, 1);
+});
+
+test("a deadline after the turn finished is a saving-phase timeout, not a startup problem", async () => {
+  const f = fixture();
+  const g = gate();
+  const h = handler(f, {
+    wallMs: 150,
+    versionProbe: async () => (await g.hold(), { ok: true, stdout: "codex-cli 0.162.1\n" }),
+    createTransport: () => scripted([imgItem(f.a), turnCompleted()]),
+  });
+  const s = await call(h, "codex_image_generate", { prompt: "x", cwd: f.base });
+  await g.entered;
+  await sleep(200);
+  g.release();
+  const done = await settle(h, s.job_id);
+  assert.equal(done.error.code, "TIMEOUT");
+  assert.deepEqual(done.error.diagnostic, { phase: "saving" });
+  assert.equal(done.error.likely_cause, "slow_generation");
+  assert.equal(done.partial_files.length, 1);
+});
+
+test("an image reported a moment before its file is complete is copied on the retry", async () => {
+  const f = fixture();
+  const late = path.join(f.home, "generated_images", "late.png");
+  const h = handler(f, {
+    createTransport: () =>
+      new FakeAppServer({
+        onRequest(msg, ctx) {
+          if (msg.method === "turn/start") {
+            setTimeout(() => ctx.send(imgItem(late)), 1);
+            setTimeout(() => (writeFileSync(late, PNG_A), ctx.send(turnCompleted())), 30);
+          }
+          return defaultReply(msg);
+        },
+      }),
+  });
+  const s = await call(h, "codex_image_generate", { prompt: "x", cwd: f.base });
+  const done = await settle(h, s.job_id);
+  assert.equal(done.state, "succeeded", JSON.stringify(done.error));
+  assert.equal(done.result.files[0].sha256, sha(PNG_A));
+});
+
+test("a queued image job creates its session only when it starts", async () => {
+  const f = fixture();
+  let n = 0;
+  const h = handler(f, {
+    imageCapabilities: async () => ({ ...REFS, continuity: true, reason: null }),
+    createTransport: () => (n++ === 0 ? scripted([]) : scripted([imgItem(f.b), turnCompleted()])),
+  });
+  const first = await call(h, "codex_image_generate", { prompt: "one", cwd: f.base });
+  assert.match(first.session_handle, /^cis_/);
+  const queued = await call(h, "codex_image_generate", { prompt: "two", cwd: f.base, queue: true });
+  assert.equal(queued.state, "queued");
+  assert.equal(queued.session_handle, null);
+  assert.deepEqual(queued.session, { continuity: "available", handle_pending: true });
+  assert.equal(h.sessions.size, 1, "no session reserved for the queued job");
+  await call(h, "codex_task_cancel", { job_id: first.job_id });
+  const done = await settle(h, queued.job_id);
+  assert.equal(done.state, "succeeded");
+  assert.match(done.result.session_handle, /^cis_/);
+  assert.equal(done.session.session_handle, done.result.session_handle);
+  assert.equal(done.session.next_action, "reuse_only_for_related_edits");
+});
+
+test("the image sink writes nothing once stopped (shutdown), salvage included", async () => {
+  const f = fixture();
+  const sink = new ImageSink(f.out, [f.home], { stop: () => true });
+  sink.add(f.a);
+  await sink.salvage();
+  await sink.salvageThreadFolder(f.home, THREAD_ID, Date.now());
+  await sink.finish();
+  assert.deepEqual(sink.files(), []);
+  assert.deepEqual(readdirSync(f.base).sort(), ["codex-home"], "no output directory created");
+});
+
+test("thread-folder salvage of a resumed thread takes only files from this turn on", async () => {
+  const f = fixture();
+  const dir = path.join(f.home, "generated_images", THREAD_ID);
+  mkdirSync(dir);
+  const prev = path.join(dir, "exec-prev.png");
+  writeFileSync(prev, PNG_A);
+  const since = Date.now();
+  const before = new Date(since - 1_000);
+  utimesSync(prev, before, before);
+  const strict = new ImageSink(f.out, [f.home]);
+  await strict.salvageThreadFolder(f.home, THREAD_ID, since, 0);
+  assert.deepEqual(strict.files(), [], "the previous turn's image is not taken");
+  const lenient = new ImageSink(f.out, [f.home]);
+  await lenient.salvageThreadFolder(f.home, THREAD_ID, since);
+  assert.equal(lenient.files().length, 1, "a new thread tolerates clock skew");
 });

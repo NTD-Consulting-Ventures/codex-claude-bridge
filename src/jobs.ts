@@ -12,7 +12,7 @@ import { randomUUID } from "node:crypto";
 import { errorHint, type LikelyCause } from "./error-hints.js";
 import type { ImageFile } from "./image-service.js";
 import { DEFAULT_JOB_TIMEOUT_S, MAX_JOB_TIMEOUT_S } from "./limits.js";
-import { TaskError, type TaskDiagnostic, type TaskErrorCode, type TurnOutcome } from "./session.js";
+import { TaskError, type Phase, type TaskDiagnostic, type TaskErrorCode, type TurnOutcome } from "./session.js";
 
 export const DEFAULT_WALL_MS = DEFAULT_JOB_TIMEOUT_S * 1000;
 export const MAX_WALL_MS = MAX_JOB_TIMEOUT_S * 1000;
@@ -84,10 +84,13 @@ export function abortCode(signal: AbortSignal): AbortCode {
   return signal.reason === "TIMEOUT" ? "TIMEOUT" : "CANCELLED";
 }
 
-/** Throws the typed root-cause error if the job signal has been aborted. */
-export function throwIfAborted(signal: AbortSignal): void {
-  if (signal.aborted) throw new TaskError(abortCode(signal));
+/** Throws the typed root-cause error if the job signal has been aborted, tagged with `phase` when given. */
+export function throwIfAborted(signal: AbortSignal, phase?: Phase): void {
+  if (signal.aborted) throw new TaskError(abortCode(signal), undefined, phase === undefined ? undefined : { phase });
 }
+
+/** Diagnostic fields that describe where and how far a run got; they stay valid for the abort's root cause. */
+const PROGRESS_FIELDS = ["phase", "images_completed", "first_model_event_ms", "last_event_ms_ago", "retried_errors", "last_retry_error_info", "last_retry_message_class"] as const;
 
 /**
  * `own` registers cleanup of output the runner created; it is awaited (before
@@ -208,13 +211,20 @@ export class JobManager {
       }
       job.runnerDone = true;
       clearTimeout(deadline);
-      // An abort observed before settlement (accepted cancel or deadline) wins.
-      if (controller.signal.aborted) {
+      // An abort observed before settlement (accepted cancel or deadline) wins, unless the
+      // runner had already determined its own failure before the abort (e.g. during salvage).
+      const decided = error instanceof TaskError && error.decided === true;
+      if (controller.signal.aborted && !decided) {
         const code = abortCode(controller.signal);
         if (!(error instanceof TaskError && error.code === code)) {
-          // A different code (e.g. the killed process exiting) is not the root cause; only saved files carry over.
+          // A different code (e.g. the killed process exiting) is not the root cause; saved files and
+          // where the run got to (phase, timing) carry over, other diagnostic details do not.
           const next = new TaskError(code);
-          if (error instanceof TaskError) next.partialFiles = error.partialFiles;
+          if (error instanceof TaskError) {
+            next.partialFiles = error.partialFiles;
+            const d = error.diagnostic;
+            if (d) next.diagnostic = Object.fromEntries(PROGRESS_FIELDS.filter((k) => d[k] !== undefined).map((k) => [k, d[k]])) as unknown as TaskDiagnostic;
+          }
           error = next;
         }
         ok = false;
