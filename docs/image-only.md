@@ -1,13 +1,14 @@
 # Image-only mode (opt-in)
 
-By default the bridge lists five tools. With `CODEX_BRIDGE_MODE=image-only` in the
+By default the bridge lists six tools. With `CODEX_BRIDGE_MODE=image-only` in the
 environment the server is started with (preferably stored in its registration; see
-[Where the mode comes from](#where-the-mode-comes-from)) it lists only these four,
+[Where the mode comes from](#where-the-mode-comes-from)) it lists only these five,
 unchanged:
 
 - `codex_status`
 - `codex_image_generate`
 - `codex_task_status`
+- `codex_task_wait`
 - `codex_task_cancel`
 
 Use it when you want Claude to see only image generation and not general task delegation.
@@ -35,14 +36,16 @@ Use it when you want Claude to see only image generation and not general task de
 
 | | general (default) | image-only |
 |---|---|---|
-| tools listed | all five | the four above |
+| tools listed | all six | the five above |
 | direct `codex_task_start` call | runs | `TOOL_DISABLED`, before any argument, `cwd` or output-folder check; no job, no Codex process |
 | unknown tool name | `UNKNOWN_TOOL` | `UNKNOWN_TOOL` |
-| `codex_task_status` / `codex_task_cancel` | any job | image jobs only; other job IDs are `UNKNOWN_JOB` |
+| `codex_task_status` / `codex_task_wait` / `codex_task_cancel` | any job | image jobs only; other job IDs are `UNKNOWN_JOB` |
 | `codex_status` | `bridge_mode: "general"` | `bridge_mode: "image-only"` |
 
-Image saving, the output folder, timeouts, cancel, `BUSY` and cleanup work exactly as in
-general mode.
+Image saving (including `partial_files`), the output folder, reference images, timeouts,
+the queue, cancel and `BUSY` work exactly as in general mode. Without `codex_task_start`,
+the reference-image fallback for an older Codex (asking Codex to open the files itself) is
+not available; use a Codex whose schema lists `localImage` input.
 
 The mode is read once when the server starts and stays fixed until it exits. There is no
 per-call option. Unset means `general`. Any other value, including an empty or
@@ -91,7 +94,7 @@ invalid value exits 1 before any CLI is found or run); a valid mode does not aff
 sign-in check, and `--check-auth` never changes MCP config.
 
 Start a new Claude Code session and ask Claude to call `codex_status`; it should report
-`"bridge_mode": "image-only"`, and `/mcp` should show four tools.
+`"bridge_mode": "image-only"`, and `/mcp` should show five tools.
 
 ## Opting an existing registration in
 

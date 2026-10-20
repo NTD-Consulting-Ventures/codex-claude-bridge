@@ -21,6 +21,7 @@ import { assertCwdShape } from "./cwd.js";
 import { selectDefaultModel, type ModelSelectionFailure } from "./model-select.js";
 import { THREAD_NAME_SET } from "./protocol-capabilities.js";
 import { classifyTurnMessage, httpStatusFromMessage, type TurnMessageClass } from "./turn-error.js";
+import type { ImageFile } from "./image-service.js";
 
 export const APPROVAL_POLICY = "on-request" as const;
 export const APPROVALS_REVIEWER = "user" as const;
@@ -89,13 +90,16 @@ export function workspaceWritePolicy(cwd: string): Record<string, unknown> {
 
 /**
  * TurnStartParams: one UserInput text item (`text_elements`, snake_case,
- * serde-default, sent as []), plus explicit cwd, approval policy, reviewer and
- * sandbox policy so nothing is inherited from config for this turn.
+ * serde-default, sent as []), then one `localImage` UserInput per validated
+ * reference image (absolute paths inside cwd, src/reference-images.ts; only
+ * sent when the schema lists that variant), plus explicit cwd, approval
+ * policy, reviewer and sandbox policy so nothing is inherited from config for
+ * this turn.
  */
-export function turnStartParams(threadId: string, prompt: string, cwd: string): Record<string, unknown> {
+export function turnStartParams(threadId: string, prompt: string, cwd: string, referenceImages: readonly string[] = []): Record<string, unknown> {
   return {
     threadId,
-    input: [{ type: "text", text: prompt, text_elements: [] }],
+    input: [{ type: "text", text: prompt, text_elements: [] }, ...referenceImages.map((p) => ({ type: "localImage", path: p }))],
     cwd: assertCwdShape(cwd),
     approvalPolicy: APPROVAL_POLICY,
     approvalsReviewer: APPROVALS_REVIEWER,
@@ -148,7 +152,8 @@ export function threadPolicyMismatch(resp: unknown, cwd: string): PolicyMismatch
   return null;
 }
 
-export type Phase = "spawn" | "initialize" | "model_select" | "thread_start" | "thread_name" | "thread_resume" | "turn_start" | "turn";
+/** Lifecycle phase; "saving" is the bridge's own post-turn work (copying images, version check). */
+export type Phase = "spawn" | "initialize" | "model_select" | "thread_start" | "thread_name" | "thread_resume" | "turn_start" | "turn" | "saving";
 
 /** CodexErrorInfo variants (schema v0.156.0). Unknown variants map to "unrecognized". */
 const CODEX_ERROR_INFO = new Set([
@@ -190,6 +195,15 @@ export interface TaskDiagnostic {
   retried_errors?: number;
   /** Which identity of a resumed bridge-owned thread did not match the session. */
   session_mismatch?: "thread_id" | "model";
+  /** Turn-phase timeouts and failures only: native image items completed before the failure. */
+  images_completed?: number;
+  /** Turn-phase timeouts and failures only: ms from turn/start to the first model event (null: none arrived). */
+  first_model_event_ms?: number | null;
+  /** Turn-phase timeouts and failures only: ms between the last turn event and the failure (null: no event). */
+  last_event_ms_ago?: number | null;
+  /** Turn-phase timeouts and failures only: whitelisted enums of the last error Codex retried (e.g. a dropped connection). */
+  last_retry_error_info?: string;
+  last_retry_message_class?: TurnMessageClass;
 }
 
 export interface TurnErrorSummary {
@@ -250,7 +264,8 @@ export type TaskErrorCode =
   | "OUTPUT_ROOT_UNAVAILABLE"
   | "THREAD_RESUME_FAILED"
   | "SESSION_STALE"
-  | "SESSION_INCOMPATIBLE";
+  | "SESSION_INCOMPATIBLE"
+  | "REFERENCE_IMAGE_INVALID";
 
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
@@ -286,6 +301,13 @@ export function requestKind(method: string): string {
 
 export class TaskError extends Error {
   diagnostic: TaskDiagnostic | undefined;
+  /** Verified images saved before the job failed (set by the job runner, reported as partial_files). */
+  partialFiles: ImageFile[] | undefined;
+  /**
+   * Set by the job runner when this failure was determined before any cancel
+   * or deadline: a later abort (during salvage) then does not replace it.
+   */
+  decided: boolean | undefined;
   constructor(
     readonly code: TaskErrorCode,
     readonly requestKind?: string,
@@ -319,6 +341,12 @@ export interface RunOptions {
   clientVersion: string;
   /** Internal (tests only): per-RPC deadline; never exposed to MCP callers. */
   rpcTimeoutMs?: number;
+  /** Validated absolute reference image paths inside cwd, sent as localImage inputs. */
+  referenceImages?: readonly string[];
+  /** Receives every completed native image item of the current turn as soon as it is known. */
+  onImage?: (savedPath: string) => void;
+  /** Receives a getter for the live run state (progress, timing, the native thread id for salvage). */
+  onState?: (get: () => TurnRunState) => void;
   /** Bridge-owned image thread (codex_image_generate with native instructions). */
   image?: ImageThreadOptions;
   /**
@@ -343,6 +371,23 @@ export interface ImageThreadOptions {
   onThread?: (threadId: string, model: string) => void;
 }
 
+/** Live state of one run, for progress reporting and post-failure salvage (bridge-internal). */
+export interface TurnRunState {
+  phase: Phase;
+  imagesCompleted: number;
+  /** ms from turn/start to the first model event; null until one arrives. */
+  firstModelEventMs: number | null;
+  /** Epoch ms of the last event for this turn; null until one arrives. */
+  lastEventAt: number | null;
+  /** Native thread id once known. Never returned to MCP callers. */
+  threadId: string | null;
+  /** Epoch ms when turn/start was sent; null before. */
+  turnStartedAt: number | null;
+}
+
+/** Failure codes that carry turn timing in their diagnostic. */
+const TIMED_CODES = new Set<TaskErrorCode>(["TIMEOUT", "TURN_FAILED", "PROCESS_EXITED", "CANCELLED", "TURN_INTERRUPTED"]);
+
 /** Events kept per (thread, turn) until the current turn is known. */
 interface TurnAcc {
   texts: Map<string, string>;
@@ -351,10 +396,20 @@ interface TurnAcc {
   images: ImageItem[];
   imagesOverflow: boolean;
   retriedErrors: number;
+  lastRetried: TurnErrorSummary | undefined;
   lastFatalError: TurnErrorSummary | undefined;
 }
 const MAX_BUFFERED_TURNS = 8;
-const newAcc = (): TurnAcc => ({ texts: new Map(), textBytes: 0, textTruncated: false, images: [], imagesOverflow: false, retriedErrors: 0, lastFatalError: undefined });
+const newAcc = (): TurnAcc => ({
+  texts: new Map(),
+  textBytes: 0,
+  textTruncated: false,
+  images: [],
+  imagesOverflow: false,
+  retriedErrors: 0,
+  lastRetried: undefined,
+  lastFatalError: undefined,
+});
 const turnKey = (threadId: string, turnId: string): string => `${threadId}\n${turnId}`;
 
 interface TurnDone {
@@ -375,7 +430,7 @@ function turnErrorCode(s: TurnErrorSummary | undefined): TaskErrorCode {
   return "TURN_FAILED";
 }
 
-const RPC_FAILURE: Record<Exclude<Phase, "spawn" | "turn">, TaskErrorCode> = {
+const RPC_FAILURE: Record<Exclude<Phase, "spawn" | "turn" | "saving">, TaskErrorCode> = {
   initialize: "INITIALIZE_FAILED",
   model_select: "MODEL_UNAVAILABLE",
   thread_start: "THREAD_START_FAILED",
@@ -414,8 +469,18 @@ export function fromClientError(e: unknown, phase: Phase): TaskError {
     case "protocol":
       return new TaskError("PROTOCOL_ERROR", undefined, d);
     default:
-      return new TaskError(phase === "spawn" || phase === "turn" ? "TURN_FAILED" : RPC_FAILURE[phase], undefined, d);
+      return new TaskError(phase === "spawn" || phase === "turn" || phase === "saving" ? "TURN_FAILED" : RPC_FAILURE[phase], undefined, d);
   }
+}
+
+/**
+ * Whether a turn notification shows model activity: an item event or delta
+ * (item/*) other than the echoed user message. Turn bookkeeping, retries,
+ * warnings (e.g. a transport fallback), thread and account updates do not
+ * count. Used only for the first-model-event latency.
+ */
+function isModelEvent(method: string, item: Record<string, unknown> | undefined): boolean {
+  return method.startsWith("item/") && item?.type !== "userMessage";
 }
 
 export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
@@ -447,6 +512,38 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
   const legacy = newAcc();
   const buffered = new Map<string, TurnAcc>();
   let bufferOverflow = false;
+
+  // Live state for progress reporting and post-failure salvage (onState getter).
+  let turnStartedAt: number | null = null;
+  let firstModelEventMs: number | null = null;
+  let lastEventAt: number | null = null;
+  /** The current turn's accumulator: the lenient one for tasks, the (thread, turn) buffer once known for images. */
+  const currentAcc = (): TurnAcc | undefined =>
+    !strict ? legacy : threadId !== undefined && turnId !== undefined ? buffered.get(turnKey(threadId, turnId)) : undefined;
+  const completedImages = (): number => currentAcc()?.images.filter((i) => i.savedPath !== null && i.status === "completed").length ?? 0;
+  // Each completed native image item of the current turn goes to opts.onImage once, in arrival order.
+  let delivered = 0;
+  const deliver = (): void => {
+    const acc = currentAcc();
+    if (!acc) return;
+    for (; delivered < acc.images.length; delivered++) {
+      const i = acc.images[delivered]!;
+      if (i.savedPath === null || i.status !== "completed") continue;
+      try {
+        opts.onImage?.(i.savedPath);
+      } catch {
+        // Saving is the caller's concern; the turn continues.
+      }
+    }
+  };
+  opts.onState?.(() => ({
+    phase,
+    imagesCompleted: completedImages(),
+    firstModelEventMs,
+    lastEventAt,
+    threadId: threadId ?? null,
+    turnStartedAt,
+  }));
 
   let failWith: ((e: TaskError) => void) | undefined;
   let turnDoneResolve: ((d: TurnDone) => void) | undefined;
@@ -490,6 +587,11 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     const p = obj(params);
     if (!p) return;
     if (threadId !== undefined && typeof p.threadId === "string" && p.threadId !== threadId) return;
+    if (turnStartedAt !== null && (turnId === undefined || typeof p.turnId !== "string" || p.turnId === turnId)) {
+      const now = Date.now();
+      lastEventAt = now;
+      if (firstModelEventMs === null && isModelEvent(method, obj(p.item))) firstModelEventMs = now - turnStartedAt;
+    }
     if (method === "item/completed") {
       const item = obj(p.item);
       if (!item) return;
@@ -512,13 +614,16 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
           savedPath: typeof item.savedPath === "string" ? item.savedPath : null,
           status: typeof item.status === "string" ? item.status.slice(0, 64) : "unknown",
         });
+        deliver();
       }
     } else if (method === "error") {
       // ErrorNotification { error: TurnError, willRetry, threadId, turnId }: only enums are kept.
       const acc = accFor(p);
       if (!acc) return;
-      if (p.willRetry === true) acc.retriedErrors = Math.min(acc.retriedErrors + 1, 1000);
-      else acc.lastFatalError = summarizeTurnError(p.error);
+      if (p.willRetry === true) {
+        acc.retriedErrors = Math.min(acc.retriedErrors + 1, 1000);
+        acc.lastRetried = summarizeTurnError(p.error);
+      } else acc.lastFatalError = summarizeTurnError(p.error);
     } else if (method === "turn/completed") {
       const turn = obj(p.turn);
       if (!turn || typeof turn.id !== "string") return;
@@ -610,10 +715,12 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     const turnDone = new Promise<TurnDone>((resolve) => {
       turnDoneResolve = resolve;
     });
-    const tr = obj(await rpc("turn/start", turnStartParams(threadId, opts.prompt, opts.cwd)));
+    turnStartedAt = Date.now();
+    const tr = obj(await rpc("turn/start", turnStartParams(threadId, opts.prompt, opts.cwd, opts.referenceImages ?? [])));
     const turn = obj(tr?.turn);
     if (!turn || typeof turn.id !== "string") throw new TaskError("PROTOCOL_ERROR");
     turnId = turn.id;
+    deliver();
     phase = "turn";
     const early = completedTurns.get(strict ? turnKey(threadId, turnId) : turnId);
     if (early) turnDoneResolve?.(early);
@@ -637,6 +744,18 @@ export async function runDelegatedTurn(opts: RunOptions): Promise<TurnOutcome> {
     return { text: [...acc.texts.values()].join("\n\n"), textTruncated: acc.textTruncated, images: acc.images, imagesOverflow: acc.imagesOverflow };
   } catch (e) {
     const err = pendingFailure ?? fromClientError(e, phase);
+    if (err.diagnostic?.phase === "turn" && TIMED_CODES.has(err.code)) {
+      const d = err.diagnostic;
+      const n = completedImages();
+      if (n > 0) d.images_completed = n;
+      d.first_model_event_ms = firstModelEventMs;
+      d.last_event_ms_ago = lastEventAt === null ? null : Date.now() - lastEventAt;
+      // A turn that times out while Codex keeps reconnecting is a network problem, not a slow model.
+      const acc = currentAcc();
+      if (acc && acc.retriedErrors > 0) d.retried_errors ??= acc.retriedErrors;
+      if (acc?.lastRetried?.info) d.last_retry_error_info = acc.lastRetried.info;
+      if (acc?.lastRetried) d.last_retry_message_class = acc.lastRetried.messageClass;
+    }
     // Best-effort interrupt of an in-flight turn, then terminate the process.
     if (threadId && turnId && !client.isClosed && err.code !== "PROCESS_EXITED") {
       try {

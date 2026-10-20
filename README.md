@@ -37,7 +37,8 @@ is; an existing `codex-image-mcp` keeps working. Afterwards start a new Claude C
 session (in Claude Desktop, a new Code session is enough).
 
 Images are saved to `~/codex-images` by default. Set `CODEX_IMAGE_OUTPUT_ROOT` to an
-absolute path before registering to use another folder. To list only the image tools,
+absolute path before registering to use another folder, and `CODEX_TASK_WALL_SECONDS`
+(10–900) to change the default job limit of 300 s ([job timeout](docs/setup.md#job-timeout)). To list only the image tools,
 see [image-only mode](docs/image-only.md) (opt-in; hides and refuses `codex_task_start`, not a sandbox).
 
 Update in place: `git pull --ff-only && npm ci && npm run build` (no re-registration).
@@ -48,13 +49,19 @@ If a stored path changes, see [Updating](docs/setup.md#updating).
 Start a new Claude Code session in a throwaway folder and ask:
 
 > Call `codex_task_start` with `cwd` set to this folder's absolute path and the prompt
-> `Create hello.txt containing hello, then draw a small red apple.` Poll
-> `codex_task_status` with the returned `job_id` until it is no longer `running`.
+> `Create hello.txt containing hello, then draw a small red apple.` Then call
+> `codex_task_wait` with the returned `job_id` until it is no longer `running`.
 
 A successful result lists saved images in `files` (empty when Codex made none), e.g.
-`/Users/you/codex-images/<uuid>/<uuid>.png`. `codex_status` shows the Codex version and
-launcher, Node, the launch policy and the image folder. This example is documentation
-only; it was not run for this release.
+`/Users/you/codex-images/<uuid>/<uuid>.png`, with `width`, `height` and `index`. If the job
+fails, times out or is cancelled, images that were already generated are still saved and
+listed in `partial_files`. `codex_status` shows the Codex version and launcher, Node, the
+launch policy, the limits, the last job and the image folder. This example is
+documentation only; it was not run for this release.
+
+For consistent characters across a series, put character sheets or an earlier version in
+the folder and pass them as `reference_images` to `codex_image_generate`. See
+[best practices for image series](docs/image-series.md).
 
 ## Limits
 
@@ -62,14 +69,18 @@ only; it was not run for this release.
   Anything needing approval stops the job with `APPROVAL_REQUIRED`; nothing is approved for you.
 - Codex still uses your normal config, plugins and MCP servers. This is a trusted-local
   convenience, not a security boundary.
-- One job at a time, 300 s by default, no retries. Image generation may use your plan
-  allowance; live image generation has not been verified for this release.
+- One running job at a time (`queue: true` queues up to 8), 300 s by default (`timeout_s`
+  10–900 per job), no retries. The bridge is local, but turns and images are generated on
+  OpenAI's servers, so a flaky connection shows up as timeouts. Image generation may use
+  your plan allowance. Live image generation was not verified by the maintainers for this
+  release (fixture tests, a schema check and a signed-out protocol check only).
 - Tested combinations and pending checks: [docs/verification.md](docs/verification.md).
 
 ## More documentation
 
 - [Setup details, discovery, updating, manual fallback and uninstall](docs/setup.md)
 - [Image-only mode: setup, existing entries and limits](docs/image-only.md)
+- [Best practices for image series: references, timeouts, partial results](docs/image-series.md)
 - [Image sessions: follow-up edits with an explicit `session_handle`](docs/image-sessions.md)
 - [Security model, tools and protocol](docs/reference.md)
 - [Troubleshooting](docs/troubleshooting.md)

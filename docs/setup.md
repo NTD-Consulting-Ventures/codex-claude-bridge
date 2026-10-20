@@ -49,7 +49,9 @@ program once, in your Terminal, and **stores absolute paths** in the registratio
 
 It then runs `--version` on both (bounded, output checked) and stops if that fails.
 Registered: `CODEX_BIN=<absolute codex>`, `CODEX_IMAGE_OUTPUT_ROOT=<absolute folder>`,
-the absolute current Node (`process.execPath`) and the absolute `dist/src/server.js`.
+the absolute current Node (`process.execPath`) and the absolute `dist/src/server.js`;
+`CODEX_BRIDGE_MODE` and `CODEX_TASK_WALL_SECONDS` only when you set them
+([job timeout](#job-timeout)).
 
 npm installs of Codex and Claude are small Node scripts (`#!/usr/bin/env node`) behind a
 symlink, so they need `node` on `PATH`. Every Codex, Claude and npm process started by
@@ -169,6 +171,25 @@ Node directory is put on the children's `PATH`; `image_output` shows the folder 
 For a first write test, use an empty throwaway folder (never your home folder) as `cwd`.
 Remote/cloud sessions cannot reach your Mac.
 
+## Job timeout
+
+Every job has a wall-clock limit: 300 s by default, 10–900 s per job with the `timeout_s`
+tool argument. To change the default, set `CODEX_TASK_WALL_SECONDS` when you register:
+
+```sh
+CODEX_TASK_WALL_SECONDS=600 npm run register -- --apply
+```
+
+The script accepts only a whole number of seconds from 10 to 900 (anything else stops it
+with exit 1, value not shown) and stores `-e CODEX_TASK_WALL_SECONDS=600` next to the other
+entries; unset stores nothing. The server itself is lenient so an existing registration
+keeps starting: an invalid value falls back to 300 s and a larger one is capped at 900 s.
+`codex_status` reports the effective default under `limits.job_timeout_s` with `source`
+and `env_issue` (`invalid` or `capped`). To add it to an existing registration, replace
+the entry as described in [Updating](#updating), with the extra
+`-e "CODEX_TASK_WALL_SECONDS=600"`. Image series: see
+[best practices](image-series.md).
+
 ## Updating
 
 Same clone, same path, no re-registration:
@@ -197,9 +218,9 @@ you already have. Below, `ID` is that existing ID (`codex-claude-bridge` or
 3. Remove only that entry: `claude mcp remove ID --scope user`. Other servers are not
    affected.
 4. Re-add it under the **same ID** with **every** recorded env entry, changing only the
-   path that moved (the register script cannot do this: it always stores just
-   `CODEX_BIN` and `CODEX_IMAGE_OUTPUT_ROOT`, and exported shell variables are not
-   forwarded into the registration). The name goes before the first `-e`:
+   path that moved (the register script cannot do this: it only creates new entries, and
+   exported shell variables are not forwarded into an existing registration). The name
+   goes before the first `-e`:
 
    ```sh
    claude mcp add --transport stdio --scope user ID \
@@ -229,7 +250,7 @@ folder, your sign-ins or the clone.
 
 ## Package names
 
-The package is `codex-claude-bridge` (version 0.2.3, not published to npm). The MCP
+The package is `codex-claude-bridge` (version 0.3.0, not published to npm). The MCP
 protocol name is `codex-claude-bridge` and new registrations use that server ID; older
 registrations named `codex-image-mcp` keep working unchanged. Both bin names,
 `codex-claude-bridge` and the legacy alias `codex-image-mcp`, start the same server. The

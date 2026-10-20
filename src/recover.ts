@@ -23,7 +23,7 @@ export const THREAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 
 export type RecoverySource = "native_saved_path" | "metadata_correlated";
 
-export interface RecoveredFile extends ImageFile {
+export interface RecoveredFile extends Omit<ImageFile, "source"> {
   source: RecoverySource;
   /** sha256 of the copy re-read from disk equals the copy-time hash. */
   copy_rehash_match: boolean;

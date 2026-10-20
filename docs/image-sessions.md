@@ -78,9 +78,14 @@ Nothing is retried automatically. Rejections returned directly by
 `SESSION_ROLLOVER_REQUIRED`, and `SESSION_INCOMPATIBLE` for a context mismatch) reject
 **this** request before any new turn. That says nothing about earlier jobs: the failed,
 cancelled or timed-out job that invalidated a session may already have consumed quota
-or produced a native image. Starting over with `fresh_session: true` and a
-self-contained description is the user's explicit choice (for `SESSION_UNKNOWN`, omit
-the handle instead; `action` is `omit_session_handle`).
+or produced a native image; such images are in that job's `partial_files`. Starting over
+with `fresh_session: true` and a self-contained description, optionally with the earlier
+file in `reference_images` so the new thread builds on it, is the user's explicit choice
+(for `SESSION_UNKNOWN`, omit the handle instead; `action` is `omit_session_handle`).
+`queue: true` cannot be combined with `session_handle`: wait for the previous job
+(`codex_task_wait`), then continue. A queued new image gets its session only when it
+starts: its start response has `session_handle: null` and `session.handle_pending: true`;
+read the handle from `codex_task_status` or the result.
 
 | code | when |
 |---|---|

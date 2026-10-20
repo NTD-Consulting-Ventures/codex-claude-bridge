@@ -55,6 +55,12 @@ export interface ImageProtocolCapabilities {
   resumeExcludeTurns: boolean;
   /** thread/name/set with threadId (string) and name (string) exists. */
   setName: boolean;
+  /**
+   * turn/start `input` items include the `localImage` UserInput variant with a
+   * string `path`: reference images can be sent as native image input.
+   * Independent of continuity.
+   */
+  localImageInput: boolean;
   /** Null when continuity is available. */
   reason: CapabilityReason | null;
 }
@@ -64,6 +70,7 @@ export const unavailable = (reason: CapabilityReason): ImageProtocolCapabilities
   continuity: false,
   resumeExcludeTurns: false,
   setName: false,
+  localImageInput: false,
   reason,
 });
 
@@ -188,6 +195,7 @@ export function capabilitiesFromMethods(table: MethodTable): ImageProtocolCapabi
     continuity: false,
     resumeExcludeTurns: has(resume, "excludeTurns", "boolean"),
     setName: has(setName, "threadId", "string") && has(setName, "name", "string"),
+    localImageInput: false,
     reason: null,
   };
   if (!nativeInstructions) caps.reason = "no_thread_start_instructions";
@@ -201,6 +209,62 @@ export function capabilitiesFromMethods(table: MethodTable): ImageProtocolCapabi
     caps.reason = "turn_params_missing";
   } else caps.continuity = true;
   return caps;
+}
+
+/** Variants of a oneOf/anyOf union schema, following $ref (bounded). */
+function unionVariants(schema: Record<string, unknown> | undefined, doc: Record<string, unknown>, depth = 0): Record<string, unknown>[] {
+  if (!schema || depth > MAX_REF_DEPTH) return [];
+  if (typeof schema.$ref === "string") return unionVariants(resolveRef(doc, schema.$ref), doc, depth + 1);
+  const alts = schema.oneOf ?? schema.anyOf;
+  return Array.isArray(alts) ? alts.flatMap((a) => (obj(a) ? [obj(a)!] : [])) : [];
+}
+
+/**
+ * Whether the turn/start params schema (`paramsDoc`: the document that holds
+ * TurnStartParams and its definitions) types `input` as an array whose items
+ * include a variant with `type` fixed to "localImage" and a string `path`.
+ */
+export function localImageInputFromParams(params: Record<string, unknown> | undefined, paramsDoc: Record<string, unknown>): boolean {
+  const props = obj(params?.properties);
+  const input = obj(props?.input);
+  if (!input) return false;
+  for (const v of unionVariants(obj(input.items), paramsDoc)) {
+    const vp = obj(v.properties);
+    const t = obj(vp?.type);
+    const tag = typeof t?.const === "string" ? t.const : Array.isArray(t?.enum) && t.enum.length === 1 ? t.enum[0] : null;
+    const p = obj(vp?.path);
+    if (tag === "localImage" && p && types(p, paramsDoc).has("string")) return true;
+  }
+  return false;
+}
+
+/** localImage support from a parsed ClientRequest schema (the turn/start variant's params). */
+export async function localImageInputFromClientRequest(
+  doc: unknown,
+  loadNamed: (name: string) => Promise<Record<string, unknown> | null> = async () => null,
+): Promise<boolean> {
+  const root = obj(doc);
+  const variants = root ? (root.oneOf ?? root.anyOf) : undefined;
+  if (!root || !Array.isArray(variants)) return false;
+  for (const v of variants) {
+    const props = obj(obj(v)?.properties);
+    const m = obj(props?.method);
+    const method = typeof m?.const === "string" ? m.const : Array.isArray(m?.enum) && m.enum.length === 1 ? m.enum[0] : null;
+    if (method !== "turn/start") continue;
+    const paramsSchema = obj(props?.params);
+    let params = paramsSchema;
+    let paramsDoc = root;
+    for (let depth = 0; params && typeof params.$ref === "string" && depth <= MAX_REF_DEPTH; depth++) params = resolveRef(root, params.$ref);
+    if (!params) {
+      const name = refName(paramsSchema);
+      const ext = name !== null ? await loadNamed(name) : null;
+      if (!ext) return false;
+      params = ext;
+      paramsDoc = ext;
+    }
+    return localImageInputFromParams(params, paramsDoc);
+  }
+  return false;
 }
 
 /** Reads one generated schema file: regular file (no symlink), bounded size, JSON object. */
@@ -250,7 +314,9 @@ export async function capabilitiesFromSchemaDir(dir: string): Promise<ImageProto
   const loadNamed = async (name: string): Promise<Record<string, unknown> | null> =>
     (await readSchemaFile(path.join(dir, "v2", `${name}.json`))) ?? (await readSchemaFile(path.join(dir, `${name}.json`)));
   try {
-    return capabilitiesFromMethods(await methodsFromClientRequest(doc, loadNamed));
+    const caps = capabilitiesFromMethods(await methodsFromClientRequest(doc, loadNamed));
+    caps.localImageInput = await localImageInputFromClientRequest(doc, loadNamed);
+    return caps;
   } catch {
     return unavailable("schema_invalid");
   }

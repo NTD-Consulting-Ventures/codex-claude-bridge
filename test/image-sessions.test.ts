@@ -22,7 +22,7 @@ import { buildServer, makeShutdown, MAX_PROMPT_CHARS, type ServerDeps } from "..
 import { defaultReply, FakeAppServer, fakeModel, threadStartResult, type Msg } from "./fake-app-server.js";
 import { nodeScript, writeExec } from "./fake-cli.js";
 
-const FULL: ImageProtocolCapabilities = { nativeInstructions: true, continuity: true, resumeExcludeTurns: true, setName: true, reason: null };
+const FULL: ImageProtocolCapabilities = { nativeInstructions: true, continuity: true, resumeExcludeTurns: true, setName: true, localImageInput: false, reason: null };
 const okProbe = async () => ({ ok: true, stdout: "codex-cli 0.156.0\n" });
 const caps = async () => ({
   plugins: { available: false, reason: "x", items: [], truncated: false, has_more: null },
@@ -580,8 +580,8 @@ test("thread/start reporting a different model than requested fails closed for i
 
 test("without continuity support: prompt-wrapper or native-instruction fallback, null handle, handles rejected", async () => {
   for (const c of [
-    { nativeInstructions: false, continuity: false, resumeExcludeTurns: false, setName: false, reason: "no_thread_start_instructions" },
-    { nativeInstructions: true, continuity: false, resumeExcludeTurns: false, setName: false, reason: "no_thread_resume" },
+    { nativeInstructions: false, continuity: false, resumeExcludeTurns: false, setName: false, localImageInput: false, reason: "no_thread_start_instructions" },
+    { nativeInstructions: true, continuity: false, resumeExcludeTurns: false, setName: false, localImageInput: false, reason: "no_thread_resume" },
   ] as ImageProtocolCapabilities[]) {
     const { w, deps } = world({ imageCapabilities: async () => c });
     const m = await connect(deps);
@@ -741,7 +741,7 @@ test("capability discovery: methods come from the ClientRequest union, params fr
   assert.equal(capabilitiesFromMethods(await methodsFromClientRequest(noResume)).reason, "no_thread_resume");
   const noInstr = structuredClone(union()) as Any;
   delete noInstr.definitions.v2.ThreadStartParams.properties.developerInstructions;
-  assert.deepEqual(capabilitiesFromMethods(await methodsFromClientRequest(noInstr)), { nativeInstructions: false, continuity: false, resumeExcludeTurns: true, setName: false, reason: "no_thread_start_instructions" });
+  assert.deepEqual(capabilitiesFromMethods(await methodsFromClientRequest(noInstr)), { nativeInstructions: false, continuity: false, resumeExcludeTurns: true, setName: false, localImageInput: false, reason: "no_thread_start_instructions" });
   const noResumeField = structuredClone(union()) as Any;
   delete noResumeField.definitions.v2.ThreadResumeParams.properties.sandbox;
   assert.equal(capabilitiesFromMethods(await methodsFromClientRequest(noResumeField)).reason, "resume_params_missing");
@@ -820,7 +820,7 @@ fs.writeFileSync(path.join(out, "v2", "Ext.json"), JSON.stringify({ type: "objec
   );
   const env = { PATH: "/usr/bin:/bin" };
   const c = await discoverImageCapabilities(bin, { env, tmpRoot: scratch });
-  assert.deepEqual(c, { nativeInstructions: true, continuity: true, resumeExcludeTurns: false, setName: true, reason: null });
+  assert.deepEqual(c, { nativeInstructions: true, continuity: true, resumeExcludeTurns: false, setName: true, localImageInput: false, reason: null });
   const argv = JSON.parse(readFileSync(log, "utf8").trim()) as string[];
   assert.deepEqual(argv.slice(0, 3), ["app-server", "generate-json-schema", "--out"]);
   assert.ok(argv[3]!.startsWith(scratch + path.sep));
@@ -1030,7 +1030,7 @@ test("MCP tools/list: the image tool advertises session_handle and fresh_session
   const client = new Client({ name: "t", version: "0" });
   await client.connect(ct);
   const tool = (await client.listTools()).tools.find((t) => t.name === "codex_image_generate")!;
-  assert.deepEqual(Object.keys(tool.inputSchema.properties!).sort(), ["cwd", "fresh_session", "prompt", "session_handle"]);
+  assert.deepEqual(Object.keys(tool.inputSchema.properties!).sort(), ["aspect", "cwd", "fresh_session", "prompt", "queue", "reference_images", "session_handle", "timeout_s"]);
   assert.deepEqual(tool.inputSchema.required, ["prompt", "cwd"]);
   assert.match(tool.description!, /ONLY|only the requested change/);
   assert.match(tool.description!, /unrelated image, omit session_handle/);

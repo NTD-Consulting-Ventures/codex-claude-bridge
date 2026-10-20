@@ -30,7 +30,8 @@
   owned folder.
 - **`IMAGE_ITEM_INVALID` / `IMAGE_VERIFICATION_FAILED`.** Codex reported an image without
   a usable saved file, or the file did not verify as a PNG/JPEG under the Codex home. The
-  job failed instead of returning partial results; any copied files were removed.
+  job failed; the images that did verify are listed in `partial_files`, nothing
+  unverified was kept.
 - **`APPROVAL_REQUIRED`.** The task needed a permission this bridge will not grant
   (writing outside `cwd`, network, escalation). Run it yourself in your own Codex
   session if appropriate. Don't work around it with bypass flags or config overrides.
@@ -43,5 +44,26 @@
   [model selection](reference.md#model-selection).
 - **Server missing in Claude Desktop.** Quit Desktop completely, reopen, and start a
   fresh **Local** Code session. Running `/mcp` in the CLI confirms the registration.
-- **`BUSY`, `TIMEOUT`, `OUTPUT_LIMIT`.** One job at a time; wait or cancel. See the
-  [limits](reference.md#tools).
+- **A failed, timed-out or cancelled image job.** Look at its `partial_files` before
+  anything else: images that were already generated are saved there (also ones Codex
+  saved but never reported, `source: "thread_folder"`). Re-running them spends quota
+  twice. Then read `error.likely_cause` ([hints](reference.md#error-hints-and-turn-timing)).
+- **`TIMEOUT` with `likely_cause: "network"`, `TURN_FAILED` (network) or a `TIMEOUT` in
+  `initialize`.** The bridge is local, but every turn and every image is generated on
+  OpenAI's servers. Codex keeps reconnecting until the job's limit. Wait until the
+  connection has been stable for about a minute, then continue.
+- **`TIMEOUT` with `slow_generation`.** The model was working but needed longer: pass a
+  larger `timeout_s` (up to 900), register `CODEX_TASK_WALL_SECONDS`
+  ([setup](setup.md#job-timeout)), or put fewer images into one job. `no_model_response`
+  or `stalled` means the backend did not answer; try a single image a little later.
+- **`codex_status` is slow or shows `stale: true`.** The plugin / MCP listing has a 10 s
+  budget; when it fails (for example offline) the last good listing is shown, marked
+  stale with its `cached_at`.
+- **`REFERENCE_IMAGE_INVALID`.** The entry at `index` was rejected for the fixed `reason`
+  (outside `cwd`, missing, a symlink, not PNG/JPEG, too large, duplicate, …). Copy the
+  file into the project folder as a regular file. **`REFERENCE_IMAGES_UNSUPPORTED`**: the
+  installed Codex schema has no `localImage` input; update Codex, or (general mode) use
+  `codex_task_start` and ask Codex to open the files with its image viewing tool.
+- **`BUSY`, `QUEUE_FULL`, `OUTPUT_LIMIT`.** One running job at a time: pass `queue: true`
+  to queue (up to 8), use `codex_task_wait`, or cancel. See the
+  [limits](reference.md#tools). Image series: [best practices](image-series.md).

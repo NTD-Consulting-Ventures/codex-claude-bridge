@@ -29,6 +29,11 @@
 // the Codex launch policy (docs/image-only.md). Existing registrations are
 // never updated to a mode by this script.
 //
+// Job timeout (src/limits.ts): CODEX_TASK_WALL_SECONDS, when set, must be a
+// whole number of seconds in 10..900; it is validated the same way and
+// persisted as `-e CODEX_TASK_WALL_SECONDS=<n>` only when set. Invalid values
+// stop the script (exit 1) without echoing the value.
+//
 // Exit codes: 0 ok / dry run / signed in, 1 setup error, 2 already registered
 // (canonical or legacy ID), 3 could not confirm absence, 4 apply or readback
 // failed, 5 (--check-auth) sign-in not confirmed.
@@ -65,6 +70,7 @@ const {
   describeProbe,
   registrationEnv,
   resolveRegisteredBridgeMode,
+  resolveRegisteredJobTimeout,
   resolveRegisteredOutputRoot,
   verifyReadback,
   KNOWN_SERVER_NAMES,
@@ -80,6 +86,8 @@ const nodeDir = currentNodeDir(node);
 // Static reason only: the raw CODEX_BRIDGE_MODE value is never echoed.
 const bridgeMode = resolveRegisteredBridgeMode(process.env);
 if (!bridgeMode.ok) fail(1, `${bridgeMode.reason}; not registering.`);
+const jobTimeout = resolveRegisteredJobTimeout(process.env);
+if (!jobTimeout.ok) fail(1, `${jobTimeout.reason}; not registering.`);
 const outRoot = checkAuth ? null : resolveRegisteredOutputRoot(process.env);
 if (outRoot && !outRoot.ok) fail(1, `${outRoot.reason}; not registering.`);
 
@@ -142,6 +150,11 @@ out(
     ? `Bridge mode (default): ${bridgeMode.mode} (CODEX_BRIDGE_MODE not set, so not stored)`
     : `Bridge mode (env): ${bridgeMode.mode} (stored as CODEX_BRIDGE_MODE=${bridgeMode.persist})`,
 );
+out(
+  jobTimeout.persist === undefined
+    ? "Job timeout (default): 300 s (CODEX_TASK_WALL_SECONDS not set, so not stored; a job can still pass timeout_s)"
+    : `Job timeout (env): ${jobTimeout.persist} s (stored as CODEX_TASK_WALL_SECONDS=${jobTimeout.persist})`,
+);
 if (bridgeMode.mode === "image-only") {
   out("  image-only hides codex_task_start from the MCP tool list and refuses direct calls to it (TOOL_DISABLED).");
   out("  It is NOT a sandbox: native Codex capabilities are unchanged; image jobs still run under your native");
@@ -169,7 +182,7 @@ if (unclear.length > 0) {
   fail(3, unclear.map((v) => `Could not confirm that no MCP server named "${v.name}" exists (claude mcp get: ${describeProbe(v.probe, v.name)}).`).join("\n") + " Not registering.");
 }
 
-const args = addArgs(node, serverJs, codex.path, outRoot.path, bridgeMode.persist);
+const args = addArgs(node, serverJs, codex.path, outRoot.path, bridgeMode.persist, jobTimeout.persist);
 out(`Command: ${JSON.stringify(claude.path)} ${args.map((a) => JSON.stringify(a)).join(" ")}`);
 if (!apply) {
   out("Dry run. Re-run with --apply to register.");
@@ -180,7 +193,7 @@ const add = spawnSync(claude.path, args, { shell: false, stdio: ["ignore", "inhe
 if (add.error || add.signal !== null || add.status !== 0) {
   fail(4, `claude mcp add failed (${describeProbe(add)}); registration not confirmed.`);
 }
-const problems = verifyReadback(get(NAME), { node, serverJs, env: registrationEnv(codex.path, outRoot.path, bridgeMode.persist) }, NAME);
+const problems = verifyReadback(get(NAME), { node, serverJs, env: registrationEnv(codex.path, outRoot.path, bridgeMode.persist, jobTimeout.persist) }, NAME);
 if (problems.length > 0) {
   fail(4, `Readback via claude mcp get did not match the requested registration; NOT confirmed:\n  - ${problems.join("\n  - ")}\nInspect with: ${sq(claude.path)} mcp get ${NAME}`);
 }
